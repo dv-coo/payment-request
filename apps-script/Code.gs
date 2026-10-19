@@ -132,7 +132,7 @@ function doPost(e) {
   }
 }
 
-const VERSION = '2026-10-22.1';
+const VERSION = '2026-10-22.2';
 
 // Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
@@ -511,6 +511,7 @@ function getLogSheet_() {
  * надсилає пробне повідомлення адміну. Безпечно запускати повторно.
  */
 function setup() {
+  checkDeployedVersion_();
   renameHeader_(getSheet_(SHEET_NAME), 'Коментар / джерело', 'Коментар');
   mapColumns_(getSheet_(SHEET_NAME));
   getLogSheet_();
@@ -831,6 +832,21 @@ function levenshtein_(a, b) {
     prev = cur;
   }
   return prev[b.length];
+}
+
+/**
+ * Анкета шле запити на WEBAPP_URL, а там працює та версія коду, яку опубліковано в розгортанні,
+ * а не та, що в редакторі. Якщо вони розійшлися — зупиняємось і кажемо, що зробити.
+ */
+function checkDeployedVersion_() {
+  const got = UrlFetchApp.fetch(execUrl_(), { muteHttpExceptions: true, followRedirects: true })
+    .getContentText().trim();
+  if (got !== 'ok ' + VERSION) {
+    throw new Error('За адресою WEBAPP_URL працює інша версія коду («' + got.slice(0, 30) + '»), ' +
+      'а в редакторі — ' + VERSION + '. Запити з анкети обробляє стара версія. ' +
+      '«Розгорнути» → «Керування розгортаннями» → розгортання з адресою з WEBAPP_URL → ✏️ → ' +
+      '«Версія: Нова версія» → «Розгорнути». Потім запустіть setup ще раз.');
+  }
 }
 
 /** Перейменовує заголовок колонки в «Запити», якщо він ще під старою назвою. */
