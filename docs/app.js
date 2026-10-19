@@ -27,6 +27,14 @@
   }
   tg.ready();
   tg.expand();
+  // На телефоні — на весь екран: без шапки Телеграма з назвою бота.
+  var mobile = tg.platform === 'ios' || tg.platform === 'android';
+  var v8 = tg.isVersionAtLeast && tg.isVersionAtLeast('8.0');
+  if (mobile && v8 && tg.requestFullscreen) {
+    try { tg.requestFullscreen(); } catch (e) { /* стара версія Телеграма — лишається звичайний вигляд */ }
+  }
+  // Щоб прокрутка анкети вниз не закривала її випадково.
+  if (tg.disableVerticalSwipes && tg.isVersionAtLeast && tg.isVersionAtLeast('7.7')) tg.disableVerticalSwipes();
   tg.setHeaderColor && tg.setHeaderColor('#e2ecf4');
   tg.setBackgroundColor && tg.setBackgroundColor('#e2ecf4');
 
@@ -58,8 +66,70 @@
   }
 
   function refresh() {
-    submit.disabled = !isValid(values());
+    var ok = isValid(values());
+    submit.disabled = !ok;
+    kbSend.hidden = !ok;
   }
+
+  /* --------- Клавіатура на телефоні: поле над клавіатурою, панель «Готово / Далі / Надіслати» --------- */
+  var ORDER = ['name', 'payDate', 'purpose', 'amount', 'requisites'];
+  var kbar = document.getElementById('kbar');
+  var kbNext = document.getElementById('kbNext');
+  var kbSend = document.getElementById('kbSend');
+  var current = null;
+
+  function placeBar() {
+    var vv = window.visualViewport;
+    var offset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+    kbar.style.bottom = offset + 'px';
+  }
+  function showCurrent() {
+    if (!current) return;
+    placeBar();
+    current.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', showCurrent);
+    window.visualViewport.addEventListener('scroll', placeBar);
+  }
+  tg.onEvent && tg.onEvent('viewportChanged', showCurrent);
+
+  form.addEventListener('focusin', function (e) {
+    var i = ORDER.indexOf(e.target.name);
+    if (i === -1) return;
+    current = e.target;
+    kbNext.hidden = i === ORDER.length - 1;
+    kbar.hidden = false;
+    document.body.classList.add('kb-open');
+    setTimeout(showCurrent, 350); // після того, як клавіатура виїхала
+  });
+  form.addEventListener('focusout', function () {
+    setTimeout(function () {
+      if (ORDER.indexOf(document.activeElement && document.activeElement.name) !== -1) return;
+      current = null;
+      kbar.hidden = true;
+      document.body.classList.remove('kb-open');
+    }, 120);
+  });
+  // Натискання на панель не має забирати фокус з поля, інакше клавіатура сховається.
+  kbar.addEventListener('pointerdown', function (e) { e.preventDefault(); });
+  function goNext() {
+    var i = current ? ORDER.indexOf(current.name) : -1;
+    if (i !== -1 && i < ORDER.length - 1) f(ORDER[i + 1]).focus();
+    else if (current) current.blur();
+  }
+  kbNext.addEventListener('click', goNext);
+  document.getElementById('kbDone').addEventListener('click', function () { if (current) current.blur(); });
+  kbSend.addEventListener('click', function () {
+    if (current) current.blur();
+    submit.click();
+  });
+  // «Далі» на самій клавіатурі для однорядкових полів.
+  ['name', 'amount'].forEach(function (n) {
+    f(n).addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); goNext(); }
+    });
+  });
   form.addEventListener('input', refresh);
   form.addEventListener('change', refresh);
   refresh();

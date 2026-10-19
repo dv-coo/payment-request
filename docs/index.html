@@ -13,7 +13,6 @@
 <body>
   <main class="wrap">
     <header class="top">
-      <img class="logo" src="logo.png" alt="APEX">
       <h1>Запит на оплату</h1>
       <p class="lead">Заповніть усі поля — запит одразу потрапить до бухгалтера.</p>
     </header>
@@ -31,7 +30,7 @@
     <form id="form" class="card" novalidate>
       <label class="field">
         <span>Ваше ім'я</span>
-        <input name="name" type="text" autocomplete="name" maxlength="200" placeholder="Ім'я та прізвище">
+        <input name="name" type="text" autocomplete="name" enterkeyhint="next" maxlength="200" placeholder="Ім'я та прізвище">
       </label>
 
       <label class="field">
@@ -41,12 +40,13 @@
 
       <label class="field">
         <span>За що оплата</span>
-        <textarea name="purpose" rows="3" maxlength="2000" placeholder="Напр.: монтаж відео для запуску, жовтень"></textarea>
+        <small class="hint">Що саме зроблено — і посилання на результат</small>
+        <textarea name="purpose" rows="4" maxlength="2000" placeholder="Монтаж відео-креативу — посилання&#10;Монтаж reels — посилання&#10;Презентація, 34 слайди — посилання"></textarea>
       </label>
 
       <label class="field">
         <span>Сума за домовленістю</span>
-        <input name="amount" type="text" inputmode="decimal" placeholder="0">
+        <input name="amount" type="text" inputmode="decimal" enterkeyhint="next" placeholder="0">
       </label>
 
       <div class="field">
@@ -80,9 +80,16 @@
 
     <section id="outside" class="card" hidden>
       <h2>Відкрийте анкету через бот</h2>
-      <p class="muted">У боті натисніть кнопку «Запит на оплату» внизу ліворуч.</p>
+      <p class="muted">У боті натисніть кнопку «📝 Запит на оплату» внизу екрана.</p>
     </section>
   </main>
+
+  <!-- Панель над клавіатурою: перехід між полями й надсилання, поки клавіатура відкрита. -->
+  <div id="kbar" class="kbar" hidden>
+    <button id="kbDone" type="button" class="kb-btn">Готово</button>
+    <button id="kbNext" type="button" class="kb-btn">Далі ↓</button>
+    <button id="kbSend" type="button" class="kb-btn kb-send" hidden>Надіслати</button>
+  </div>
   <script src="app.js"></script>
 </body>
 </html>
