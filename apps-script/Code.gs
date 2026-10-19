@@ -8,9 +8,9 @@
  * Властивості скрипта (Налаштування проєкту → Властивості скрипта):
  *   SHEET_ID         — ID таблиці реєстру
  *   BOT_TOKEN        — токен бота
- *   NOTIFY_CHAT_IDS  — Telegram ID бухгалтерів через кому
- *   ADMIN_CHAT_ID    — Telegram ID Дмитра (моніторинг)
+ *   ADMIN_CHAT_ID    — Telegram ID Дмитра: сповіщення про запити й моніторинг
  * Необов'язкові:
+ *   NOTIFY_CHAT_IDS     — кому ще слати сповіщення про запити, ID через кому
  *   WHITELIST_ENABLED   — 'true', щоб пускати лише WHITELIST_IDS (за замовчуванням вимкнено)
  *   WHITELIST_IDS       — Telegram ID через кому
  *   RATE_LIMIT_PER_HOUR — за замовчуванням 5
@@ -312,7 +312,7 @@ function notifyAccountants_(code, c, user, rate, countThisHour) {
   ];
   if (rate == null) lines.push('⚠️ Курс НБУ не підтягнувся — поставте вручну.');
   if (countThisHour > 1) lines.push('ℹ️ Це ' + countThisHour + '-й запит від цієї людини за годину — перевірте на дубль.');
-  idList_(prop_('NOTIFY_CHAT_IDS')).forEach((id) => sendMessage_(id, lines.join('\n')));
+  recipients_().forEach((id) => sendMessage_(id, lines.join('\n')));
 }
 
 function sendMessage_(chatId, text) {
@@ -391,11 +391,11 @@ function setup() {
   ScriptApp.newTrigger('dailyMonitor').timeBased().everyDays(1).atHour(9).inTimezone(TZ).create();
   ScriptApp.newTrigger('monthlyBackup').timeBased().onMonthDay(1).atHour(3).inTimezone(TZ).create();
 
-  const failed = idList_(prop_('NOTIFY_CHAT_IDS')).concat(idList_(prop_('ADMIN_CHAT_ID')))
+  const failed = recipients_()
     .filter((id) => !sendMessage_(id, '✅ Приймач запитів на оплату підключено. Сюди приходитимуть сповіщення.'));
   if (failed.length) {
     throw new Error('Кнопку поставлено, але не вдалося написати: ' + failed.join(', ') +
-      '. Ця людина має спершу натиснути «Start» у боті, потім запустіть setup() ще раз.');
+      '. Спершу натисніть «Start» у боті, потім запустіть setup() ще раз.');
   }
   Logger.log('Готово. Кнопка «%s» у боті веде на %s', MENU_BUTTON_TEXT, FORM_URL);
 }
@@ -447,6 +447,12 @@ function prop_(key, required) {
   const v = PropertiesService.getScriptProperties().getProperty(key);
   if (required && !v) throw new Error('Не задано властивість скрипта ' + key);
   return v;
+}
+
+/** Адмін + додаткові отримувачі, без повторів. */
+function recipients_() {
+  const ids = idList_(prop_('ADMIN_CHAT_ID', true)).concat(idList_(prop_('NOTIFY_CHAT_IDS')));
+  return ids.filter((id, i) => ids.indexOf(id) === i);
 }
 
 function idList_(s) {
