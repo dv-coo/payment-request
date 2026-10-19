@@ -116,8 +116,11 @@ function doPost(e) {
   }
 }
 
+const VERSION = '2026-10-20.1';
+
+// Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
-  return ContentService.createTextOutput('ok');
+  return ContentService.createTextOutput('ok ' + VERSION);
 }
 
 function json_(obj) {
@@ -270,12 +273,11 @@ function appendRequest_(clean, tgUser, rate) {
     sheet.getRange(row, 1, 1, width).setValues([values]);
 
     // Формула, а не число: перерахується, коли бухгалтер поправить курс.
-    // setFormula, бо він завжди розбирає англійський синтаксис (коми), а setValues —
-    // за локаллю таблиці, де в українській розділювач «;».
+    // Без жодного розділювача аргументів (ні «,», ні «;»), тож однаково розбирається
+    // за будь-якої локалі таблиці. Курс порожній → ділення на 0 → IFERROR дає порожньо.
     const a = colLetter_(cols.amount + 1) + row;
     const r = colLetter_(cols.rate + 1) + row;
-    sheet.getRange(row, cols.amountUah + 1)
-      .setFormula('=IF(OR(' + a + '="",' + r + '=""),"",' + a + '*' + r + ')');
+    sheet.getRange(row, cols.amountUah + 1).setFormula('=IFERROR(' + a + '*' + r + '/(' + r + '<>""))');
     SpreadsheetApp.flush();
     return { code: code, row: row };
   } finally {
