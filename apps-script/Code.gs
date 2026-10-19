@@ -3,7 +3,7 @@
  *
  * Одна точка входу (doPost), два види звернень:
  *  - анкета: перевірка підпису Телеграма → ліміти → курс НБУ → новий рядок у «Запити» →
- *    сповіщення й підтвердження контрагенту. Кожне звернення пишеться в лист «Лог»;
+ *    сповіщення й підтвердження контрагенту. Кожне звернення пишеться в лист «Історія змін»;
  *  - вебхук бота (?tg=секрет): на /start — інструкція з кнопкою анкети, будь-яке інше
  *    повідомлення видаляється, бот лише нагадує про кнопку. Чат з ботом не для листування.
  *
@@ -11,7 +11,8 @@
  *   SHEET_ID         — ID таблиці реєстру
  *   BOT_TOKEN        — токен бота
  *   ADMIN_CHAT_ID    — Telegram ID Дмитра: сповіщення про запити й моніторинг
- *   FINMAP_TOKEN     — ключ API FinMap (заголовок apiKey) для списку категорій
+ *   FINMAP_TOKEN     — ключ API FinMap (заголовок apiKey): довідники категорій, рахунків,
+ *                      проєктів і контрагентів
  * Необов'язкові:
  *   NOTIFY_CHAT_IDS     — кому ще слати сповіщення про запити, ID через кому
  *   WHITELIST_ENABLED   — 'true', щоб пускати лише WHITELIST_IDS (за замовчуванням вимкнено)
@@ -21,13 +22,15 @@
  */
 
 const SHEET_NAME = 'Запити';
-const LOG_SHEET_NAME = 'Лог';
+const LOG_SHEET_NAME = 'Історія змін';
+const OLD_LOG_SHEET_NAME = 'Лог'; // назва з першої версії — перейменовується автоматично
+const SYSTEM_LOG_ID = 'система'; // службові записи (довідники тощо), не звернення людей
 const FORM_URL = 'https://dv-coo.github.io/payment-request/';
 const MENU_BUTTON_TEXT = 'Запит на оплату';
 const TZ = 'Europe/Kyiv';
 const CURRENCIES = ['UAH', 'USD', 'EUR', 'PLN', 'USDT'];
 const INIT_DATA_MAX_AGE_SEC = 24 * 3600;
-const FINMAP_EXPENSE_CATEGORIES_URL = 'https://api.finmap.online/v2.2/categories/expense';
+const FINMAP_API = 'https://api.finmap.online/v2.2';
 const DICT_SHEET_NAME = 'Довідники';
 const ARCHIVE_PREFIX = '[Архів]';
 
@@ -67,7 +70,7 @@ const COL = {
   counterparty: 'Контрагент (як у FM)',
   category:     'Категорія (як у FM)',
   project:      'Проєкт',
-  comment:      'Коментар / джерело',
+  comment:      ['Коментар', 'Коментар / джерело'], // друга — назва з першої версії
   contacts:     'Контакти контрагента',
 };
 
@@ -106,11 +109,12 @@ function doPost(e) {
     }
 
     const rate = fetchRate_(clean.currency, new Date());
-    const res = appendRequest_(clean, user, rate);
+    const fmName = matchCounterparty_(clean.name);
+    const res = appendRequest_(clean, user, rate, fmName);
     rememberRequest_(tgId);
     log_(tgId, 'прийнято', res.code);
 
-    notifyAccountants_(res.code, clean, user, rate, recent + 1);
+    notifyAccountants_(res.code, clean, user, rate, recent + 1, fmName);
     sendMessage_(user.id, 'Запит прийнято. Код: ' + res.code + '\nБухгалтер отримав сповіщення.');
 
     return json_({ ok: true, code: res.code });
@@ -120,7 +124,7 @@ function doPost(e) {
   }
 }
 
-const VERSION = '2026-10-21.1';
+const VERSION = '2026-10-21.2';
 
 // Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
@@ -250,7 +254,7 @@ function fetchRate_(currency, date) {
 /* ============================== Запис ============================== */
 
 /** Додає один рядок у лист «Запити». Повертає { code, row }. Наявні рядки не змінює. */
-function appendRequest_(clean, tgUser, rate) {
+function appendRequest_(clean, tgUser, rate, fmName) {
   const sheet = getSheet_(SHEET_NAME);
   const cols = mapColumns_(sheet);
 
@@ -260,6 +264,11 @@ function appendRequest_(clean, tgUser, rate) {
   try {
     const code = nextCode_(sheet, cols, new Date());
     const row = sheet.getLastRow() + 1;
+    if (row > sheet.getMaxRows()) {
+      sheet.insertRowsAfter(sheet.getMaxRows(), 100);
+      const dict = sheet.getParent().getSheetByName(DICT_SHEET_NAME);
+      if (dict) applyValidations_(sheet, dict);
+    }
     const width = sheet.getLastColumn();
     const values = new Array(width).fill('');
 
@@ -269,7 +278,7 @@ function appendRequest_(clean, tgUser, rate) {
     values[cols.amount] = clean.amount;
     values[cols.currency] = clean.currency;
     values[cols.rate] = rate == null ? '' : rate;
-    values[cols.counterparty] = clean.name;
+    values[cols.counterparty] = fmName || ''; // ім'я як у FinMap; як написала людина — у «Контактах»
     values[cols.comment] = clean.purpose;
     values[cols.contacts] = contacts_(tgUser, clean.name);
     // Статус, Хто проводить, Рахунок списання, Категорія, Проєкт — порожні.
@@ -315,9 +324,10 @@ function mapColumns_(sheet) {
   const cols = {};
   const missing = [];
   Object.keys(COL).forEach((key) => {
-    const i = headers.indexOf(norm(COL[key]));
-    if (i === -1) missing.push(COL[key]);
-    cols[key] = i;
+    const names = [].concat(COL[key]);
+    const found = names.map((n) => headers.indexOf(norm(n))).filter((i) => i !== -1);
+    if (!found.length) missing.push(names[0]);
+    cols[key] = found.length ? found[0] : -1;
   });
   if (missing.length) throw new Error('У листі «' + SHEET_NAME + '» не знайдено колонок: ' + missing.join(', '));
   return cols;
@@ -371,7 +381,7 @@ function handleBotUpdate_(e) {
       sendWithFormButton_(chatId, NO_CHAT_TEXT);
     }
   } catch (err) {
-    log_('', 'помилка', 'бот: ' + (err && err.message || err));
+    log_(SYSTEM_LOG_ID, 'помилка', 'бот: ' + (err && err.message || err));
   }
   return ok;
 }
@@ -405,10 +415,11 @@ function formUrl_() {
 
 /* ============================ Телеграм ============================ */
 
-function notifyAccountants_(code, c, user, rate, countThisHour) {
+function notifyAccountants_(code, c, user, rate, countThisHour, fmName) {
   const lines = [
     '🧾 Новий запит на оплату ' + code,
     'Від: ' + c.name + (user.username ? ' (@' + user.username + ')' : ' (tg id ' + user.id + ')'),
+    fmName ? 'У FM: ' + fmName : '⚠️ Контрагента в FM не знайдено — оберіть у колонці «Контрагент (як у FM)».',
     'Сума: ' + formatAmount_(c.amount) + ' ' + c.currency,
     'Бажана дата: ' + Utilities.formatDate(c.payDate, TZ, 'dd.MM.yyyy'),
     'За що: ' + c.purpose,
@@ -445,7 +456,7 @@ function formatAmount_(n) {
   return int.replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + (frac === '00' ? '' : ',' + frac);
 }
 
-/* ============================== Лог ============================== */
+/* =========================== Історія змін =========================== */
 
 function log_(tgId, result, details) {
   try {
@@ -458,6 +469,9 @@ function log_(tgId, result, details) {
 function getLogSheet_() {
   const ss = SpreadsheetApp.openById(prop_('SHEET_ID', true));
   let sheet = ss.getSheetByName(LOG_SHEET_NAME);
+  if (!sheet && ss.getSheetByName(OLD_LOG_SHEET_NAME)) {
+    sheet = ss.getSheetByName(OLD_LOG_SHEET_NAME).setName(LOG_SHEET_NAME);
+  }
   if (!sheet) {
     sheet = ss.insertSheet(LOG_SHEET_NAME);
     sheet.appendRow(['Час', 'Telegram ID', 'Результат', 'Деталі']);
@@ -470,10 +484,12 @@ function getLogSheet_() {
 
 /**
  * Запустити ОДИН раз після публікації веб-застосунку. Робить усе налаштування:
- * перевіряє колонки, створює «Лог», ставить кнопку в бот, вмикає щоденний моніторинг
- * і щомісячний бекап, надсилає пробне повідомлення бухгалтерам і адміну.
+ * перевіряє колонки, створює «Історія змін», налаштовує бота, підтягує довідники з FinMap
+ * і ставить спадні меню, вмикає щоденні оновлення, моніторинг і щомісячний бекап,
+ * надсилає пробне повідомлення адміну. Безпечно запускати повторно.
  */
 function setup() {
+  renameHeader_(getSheet_(SHEET_NAME), 'Коментар / джерело', 'Коментар');
   mapColumns_(getSheet_(SHEET_NAME));
   getLogSheet_();
 
@@ -501,7 +517,7 @@ function setup() {
   });
 
   ScriptApp.getProjectTriggers().forEach((t) => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('syncCategories').timeBased().everyDays(1).atHour(8).inTimezone(TZ).create();
+  ScriptApp.newTrigger('syncDictionaries').timeBased().everyDays(1).atHour(8).inTimezone(TZ).create();
   ScriptApp.newTrigger('dailyMonitor').timeBased().everyDays(1).atHour(9).inTimezone(TZ).create();
   ScriptApp.newTrigger('monthlyBackup').timeBased().onMonthDay(1).atHour(3).inTimezone(TZ).create();
 
@@ -511,10 +527,11 @@ function setup() {
     throw new Error('Бот налаштовано, але не вдалося написати: ' + failed.join(', ') +
       '. Спершу натисніть «Start» у боті, потім запустіть setup() ще раз.');
   }
-  if (!syncCategories()) {
-    throw new Error('Бот налаштовано, але категорії з FinMap не підтягнулися. Дивіться лист «Лог».');
+  const sync = syncDictionaries();
+  if (sync.errors.length) {
+    throw new Error('Бот налаштовано, але не всі довідники з FinMap підтягнулися: ' + sync.errors.join('; '));
   }
-  Logger.log('Готово. Бот налаштовано, кнопка «%s» веде на %s', MENU_BUTTON_TEXT, FORM_URL);
+  Logger.log('Готово. Довідники з FinMap: %s', JSON.stringify(sync.counts));
 }
 
 /** Щодня: якщо за добу були спроби, але жодна не пройшла, — сповіщення адміну. */
@@ -524,13 +541,14 @@ function dailyMonitor() {
   if (last < 2) return;
   const since = Date.now() - 86400000;
   const first = Math.max(2, last - 999);
-  const rows = sheet.getRange(first, 1, last - first + 1, 3).getValues()
-    .filter((r) => r[0] instanceof Date && r[0].getTime() > since);
+  const rows = sheet.getRange(first, 1, last - first + 1, 4).getValues()
+    .filter((r) => r[0] instanceof Date && r[0].getTime() > since)
+    .filter((r) => r[1] !== SYSTEM_LOG_ID); // службові записи — не спроби подати запит
   const accepted = rows.filter((r) => r[2] === 'прийнято').length;
   const errors = rows.filter((r) => r[2] === 'помилка').length;
   if (rows.length && !accepted) {
     sendMessage_(prop_('ADMIN_CHAT_ID'), '⚠️ Форма запитів: за добу ' + rows.length +
-      ' спроб, жодна не пройшла (помилок: ' + errors + '). Дивіться лист «Лог».');
+      ' спроб, жодна не пройшла (помилок: ' + errors + '). Дивіться лист «Історія змін».');
   }
 }
 
@@ -554,62 +572,248 @@ function monthlyBackup() {
 
 /* ============================== FinMap ============================== */
 
+// Довідники в прихованому аркуші «Довідники»: по колонці на кожен, у порядку цього списку.
+// key — колонка «Запитів», яка отримує спадне меню. Перший шлях обов'язковий, решта —
+// додаткові: частину старих розділів API FinMap позначено застарілими, їх просто пропускаємо.
+const DICTS = [
+  { key: 'category',     title: 'Категорії',   paths: ['/categories/expense'] },
+  { key: 'account',      title: 'Рахунки',     paths: ['/accounts'] },
+  { key: 'project',      title: 'Проєкти',     paths: ['/projects'] },
+  { key: 'counterparty', title: 'Контрагенти', paths: ['/suppliers', '/employees', '/owners', '/creditors'] },
+];
+
 /**
- * Оновлює спадне меню «Категорія (як у FM)» списком витратних категорій з FinMap.
- * Без системних і без [Архів]; разові події з минулими датами лишаються.
- * Список лежить у прихованому аркуші «Довідники». Якщо FinMap не відповів —
- * лишається попередній список, причина йде в «Лог». Повертає кількість категорій (0 — помилка).
+ * Щодня: оновлює довідники з FinMap і спадні меню в «Запити». Якщо якийсь список FinMap
+ * не віддав — лишається попередній, причина йде в «Історія змін» і адміну в бот.
+ * Повертає { counts, errors }.
  */
-function syncCategories() {
-  let labels;
-  try {
-    labels = fetchExpenseCategoryLabels_();
-  } catch (e) {
-    log_('', 'помилка', 'FinMap категорії: ' + e.message);
-    return 0;
-  }
+function syncDictionaries() {
   const ss = SpreadsheetApp.openById(prop_('SHEET_ID', true));
   let dict = ss.getSheetByName(DICT_SHEET_NAME);
   if (!dict) {
     dict = ss.insertSheet(DICT_SHEET_NAME);
     dict.hideSheet();
   }
-  dict.clearContents();
-  dict.getRange(1, 1, labels.length, 1).setValues(labels.map((l) => [l]));
-  applyCategoryValidation_(getSheet_(SHEET_NAME), dict, labels.length);
-  return labels.length;
+  const counts = {};
+  const errors = [];
+  DICTS.forEach((d, i) => {
+    try {
+      const labels = finmapLabels_(d.paths);
+      if (dict.getMaxRows() < labels.length + 1) {
+        dict.insertRowsAfter(dict.getMaxRows(), labels.length + 1 - dict.getMaxRows());
+      }
+      dict.getRange(1, i + 1, dict.getMaxRows(), 1).clearContent();
+      dict.getRange(1, i + 1, labels.length + 1, 1).setValues([[d.title]].concat(labels.map((l) => [l])));
+      counts[d.key] = labels.length;
+    } catch (e) {
+      errors.push(d.title + ': ' + e.message);
+      log_(SYSTEM_LOG_ID, 'помилка', 'FinMap ' + d.title + ': ' + e.message);
+    }
+  });
+  applyValidations_(getSheet_(SHEET_NAME), dict);
+  if (errors.length) {
+    sendMessage_(prop_('ADMIN_CHAT_ID'), '⚠️ Довідники з FinMap не оновились: ' + errors.join('; ') +
+      '\nСпадні меню працюють зі старим списком.');
+  }
+  return { counts: counts, errors: errors };
 }
 
-function fetchExpenseCategoryLabels_() {
-  const resp = UrlFetchApp.fetch(FINMAP_EXPENSE_CATEGORIES_URL, {
-    method: 'get',
-    headers: { apiKey: prop_('FINMAP_TOKEN', true), Accept: 'application/json' },
-    muteHttpExceptions: true,
+/** Назви зі списків FinMap: без системних і [Архів], без дублів, за алфавітом. */
+function finmapLabels_(paths) {
+  const labels = [];
+  paths.forEach((path, i) => {
+    const resp = UrlFetchApp.fetch(FINMAP_API + path, {
+      headers: { apiKey: prop_('FINMAP_TOKEN', true), Accept: 'application/json' },
+      muteHttpExceptions: true,
+    });
+    if (resp.getResponseCode() !== 200) {
+      if (i === 0) throw new Error(path + ': код ' + resp.getResponseCode() + ' ' + resp.getContentText().slice(0, 200));
+      return;
+    }
+    JSON.parse(resp.getContentText()).forEach((item) => {
+      const label = String(item.label || '').replace(/\s+/g, ' ').trim();
+      if (label && !item.isSystem && label.indexOf(ARCHIVE_PREFIX) !== 0) labels.push(label);
+    });
   });
-  if (resp.getResponseCode() !== 200) {
-    throw new Error('код ' + resp.getResponseCode() + ': ' + resp.getContentText().slice(0, 200));
-  }
-  const labels = JSON.parse(resp.getContentText())
-    .filter((c) => !c.isSystem)
-    .map((c) => String(c.label || '').replace(/\s+/g, ' ').trim())
-    .filter((l) => l && l.indexOf(ARCHIVE_PREFIX) !== 0);
   const unique = [...new Set(labels)];
-  if (!unique.length) throw new Error('FinMap повернув порожній список категорій');
+  if (!unique.length) throw new Error(paths[0] + ': FinMap повернув порожній список');
   return unique.sort((a, b) => a.localeCompare(b, 'uk'));
 }
 
 /**
- * Спадне меню в колонці категорії, з другого рядка. Вводити можна й вручну:
- * значення поза списком дає попередження, а не помилку.
+ * Спадні меню в «Запити» з другого рядка до кінця аркуша:
+ *  - категорія, рахунок, проєкт, контрагент — зі списків у «Довідниках». Значення поза
+ *    списком дає попередження, а не помилку, тож вручну вводити можна;
+ *  - «Статус» і «Хто проводить» — копія меню з рядка 2, яке налаштоване вручну.
  */
-function applyCategoryValidation_(sheet, dict, count) {
+function applyValidations_(sheet, dict) {
   const cols = mapColumns_(sheet);
   const rows = Math.max(1, sheet.getMaxRows() - 1);
-  const rule = SpreadsheetApp.newDataValidation()
-    .requireValueInRange(dict.getRange(1, 1, count, 1), true)
-    .setAllowInvalid(true)
-    .build();
-  sheet.getRange(2, cols.category + 1, rows, 1).setDataValidation(rule);
+  DICTS.forEach((d, i) => {
+    const n = dict.getRange(1, i + 1, dict.getMaxRows(), 1).getValues().filter((r) => r[0] !== '').length - 1;
+    if (n < 1) return;
+    const rule = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(dict.getRange(2, i + 1, n, 1), true)
+      .setAllowInvalid(true)
+      .build();
+    sheet.getRange(2, cols[d.key] + 1, rows, 1).setDataValidation(rule);
+  });
+  ['status', 'executor'].forEach((key) => {
+    const template = sheet.getRange(2, cols[key] + 1).getDataValidation();
+    if (template) {
+      sheet.getRange(2, cols[key] + 1, rows, 1).setDataValidation(template);
+    } else {
+      log_(SYSTEM_LOG_ID, 'помилка', 'У рядку 2 колонки «' + COL[key] + '» немає спадного меню — нема що копіювати');
+    }
+  });
+}
+
+/* ===================== Підбір контрагента з FinMap ===================== */
+
+// Варіанти одного імені (укр/рос/скорочені). Слово може бути в кількох групах («Саша»).
+const NAME_GROUPS = [
+  'олександр александр алекс саша шура', 'олександра александра саша', 'дмитро дмитрий дима',
+  'анастасія анастасия настя', 'наталія наталья наталя натали наталі наташа', 'катерина екатерина катя',
+  'вікторія виктория віка вика', 'юлія юлия юля', 'марія мария маша', 'олексій алексей льоша леша',
+  'ірина ирина іра ира', 'ольга оля', 'анна ганна аня', "єлизавета елизавета ліза лиза",
+  'владислав влад', 'владислава влада', 'валерія валерия лера', 'валентина валя', 'микола николай коля',
+  'павло павел паша', 'сергій сергей', 'андрій андрей', 'іван иван ваня', 'кирило кирилл',
+  'олена елена алена альона лена', 'тетяна татьяна таня', 'софія софия соня', 'роман рома',
+  'євген евгений женя', 'євгенія евгения женя', 'ростислав слава', 'ярослав слава', 'станіслав стас',
+  'василь василий вася', "дарія дарья дария даша", 'максим макс', 'нікіта никита микита',
+  'данило данил даниил', 'михайло михаил миша', 'надія надежда надя', 'людмила люда',
+  'світлана светлана света', 'галина галя', 'поліна полина', 'мирослава мира', 'богдан бодя',
+];
+const NAME_STOPWORDS = ['фоп', 'ффоп', 'тов', 'пп', 'fop'];
+let nameGroupIndex_ = null;
+
+/**
+ * Найближче до введеного ім'я з довідника контрагентів, або '' якщо надійного збігу немає.
+ * Враховує порядок слів, укр/рос написання, латинські літери в кириличних словах, «ФОП»,
+ * по батькові, ініціали, зменшувальні імена й дрібні одруківки.
+ */
+function matchCounterparty_(name) {
+  try {
+    const dict = SpreadsheetApp.openById(prop_('SHEET_ID', true)).getSheetByName(DICT_SHEET_NAME);
+    if (!dict) return '';
+    const col = DICTS.findIndex((d) => d.key === 'counterparty') + 1;
+    const labels = dict.getRange(2, col, Math.max(1, dict.getMaxRows() - 1), 1).getValues()
+      .map((r) => String(r[0])).filter(Boolean);
+    return bestNameMatch_(name, labels);
+  } catch (e) {
+    log_(SYSTEM_LOG_ID, 'помилка', 'Підбір контрагента: ' + e.message);
+    return '';
+  }
+}
+
+function bestNameMatch_(name, labels) {
+  const q = nameTokens_(name);
+  if (!q.length) return '';
+  let best = null;
+  labels.forEach((label) => {
+    const c = nameTokens_(label);
+    if (!c.length) return;
+    const m = nameScore_(q, c);
+    if (!m.ok) return;
+    const better = !best || m.score > best.score + 1e-9 ||
+      (Math.abs(m.score - best.score) < 1e-9 &&
+        (m.exact > best.exact || (m.exact === best.exact && label.length > best.label.length)));
+    if (better) best = { label: label, score: m.score, exact: m.exact };
+  });
+  return best ? best.label : '';
+}
+
+function nameScore_(q, c) {
+  const optional = (t) => t.length === 1 || isPatronymic_(t); // ініціали й по батькові
+  let sum = 0;
+  let weight = 0;
+  let exact = 0;
+  let anchor = false; // є збіг по слову, яке не є просто поширеним ім'ям (прізвище тощо)
+  let meaningful = 0; // скільки слів імені «працює»: повні слова й ініціали, що збіглися
+  q.forEach((t) => {
+    let bestSim = 0;
+    c.forEach((u) => { bestSim = Math.max(bestSim, tokenSim_(t, u)); });
+    if (c.indexOf(t) !== -1) exact++;
+    if (bestSim >= 0.85 && t.length >= 3 && !nameGroups_()[t]) anchor = true;
+    if (optional(t)) {
+      // Збіг ініціала чи по батькові — повний плюс; відсутність — легкий мінус.
+      if (bestSim > 0) { sum += 1; weight += 1; meaningful++; } else { weight += 0.15; }
+      return;
+    }
+    sum += bestSim;
+    weight++;
+    meaningful++;
+  });
+  // Яку частку «справжніх» слів кандидата пояснює введене ім'я (по батькові кандидата не штрафує).
+  const isCovered = (u) => q.some((t) => tokenSim_(t, u) >= 0.6);
+  const counted = c.filter((u) => !optional(u) || isCovered(u));
+  const covered = counted.filter(isCovered).length;
+  const score = weight ? 0.8 * (sum / weight) + 0.2 * (counted.length ? covered / counted.length : 0) : 0;
+  const sameTokens = q.length === c.length && q.every((t) => c.indexOf(t) !== -1);
+  // Одне слово (лише ім'я чи лише прізвище) — тільки точний збіг: інакше легко вгадати не ту людину.
+  return { score: score, exact: exact, ok: sameTokens || (meaningful >= 2 && anchor && score >= 0.75) };
+}
+
+function tokenSim_(a, b) {
+  if (a === b) return 1;
+  const ga = nameGroups_()[a];
+  const gb = nameGroups_()[b];
+  if (ga && gb && ga.some((g) => gb.indexOf(g) !== -1)) return 1;
+  if (a.length === 1 || b.length === 1) return a[0] === b[0] ? 0.6 : 0;
+  const short = a.length < b.length ? a : b;
+  const long = a.length < b.length ? b : a;
+  if (short.length >= 4 && long.indexOf(short) === 0) return 0.85; // Губарев / Губарева
+  const r = 1 - levenshtein_(a, b) / long.length;
+  return r >= 0.8 ? r : 0;
+}
+
+function isPatronymic_(t) {
+  return /(ович|евич|ич|ивна|овна|евна|ична)$/.test(t) && t.length > 5;
+}
+
+function nameGroups_() {
+  if (!nameGroupIndex_) {
+    nameGroupIndex_ = {};
+    NAME_GROUPS.forEach((g, i) => g.split(' ').forEach((w) => {
+      const k = foldName_(w);
+      (nameGroupIndex_[k] = nameGroupIndex_[k] || []).push(i);
+    }));
+  }
+  return nameGroupIndex_;
+}
+
+function nameTokens_(s) {
+  return String(s || '').toLowerCase().split(/[^a-zа-яіїєґёыэъ'’ʼ`]+/i)
+    .map(foldName_).filter((t) => t && NAME_STOPWORDS.indexOf(t) === -1);
+}
+
+/** Спільна форма для укр/рос написання; латинські двійники в кириличних словах → кирилиця. */
+function foldName_(w) {
+  let t = String(w).toLowerCase();
+  if (/[а-яіїєґё]/.test(t)) {
+    const lat = { a: 'а', c: 'с', e: 'е', i: 'і', o: 'о', p: 'р', x: 'х', y: 'у', k: 'к', m: 'м', t: 'т', h: 'н', b: 'в' };
+    t = t.replace(/[aceiopxykmthb]/g, (ch) => lat[ch]);
+  }
+  return t.replace(/[іїы]/g, 'и').replace(/[єэё]/g, 'е').replace(/ґ/g, 'г').replace(/[ьъ'’ʼ`]/g, '');
+}
+
+function levenshtein_(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+/** Перейменовує заголовок колонки в «Запити», якщо він ще під старою назвою. */
+function renameHeader_(sheet, from, to) {
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const i = headers.findIndex((h) => String(h).replace(/\s+/g, ' ').trim() === from);
+  if (i !== -1) sheet.getRange(1, i + 1).setValue(to);
 }
 
 /* ============================== Утиліти ============================== */
