@@ -95,7 +95,8 @@ function doPost(e) {
     }
 
     const recent = recentTimes_(tgId).length;
-    if (recent >= rateLimit_()) {
+    const isAdmin = idList_(prop_('ADMIN_CHAT_ID')).indexOf(tgId) !== -1; // адміну ліміт не потрібен
+    if (!isAdmin && recent >= rateLimit_()) {
       log_(tgId, 'відхилено', 'ліміт запитів за годину');
       return json_({ ok: false, error: 'Забагато запитів за годину. Спробуйте пізніше.' });
     }
@@ -124,7 +125,7 @@ function doPost(e) {
   }
 }
 
-const VERSION = '2026-10-21.2';
+const VERSION = '2026-10-21.3';
 
 // Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
