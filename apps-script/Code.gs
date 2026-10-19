@@ -243,12 +243,15 @@ function appendRequest_(clean, tgUser, rate) {
     values[cols.contacts] = contacts_(tgUser, clean.name);
     // Статус, Хто проводить, Рахунок списання, Категорія, Проєкт — порожні.
 
+    sheet.getRange(row, 1, 1, width).setValues([values]);
+
     // Формула, а не число: перерахується, коли бухгалтер поправить курс.
+    // setFormula, бо він завжди розбирає англійський синтаксис (коми), а setValues —
+    // за локаллю таблиці, де в українській розділювач «;».
     const a = colLetter_(cols.amount + 1) + row;
     const r = colLetter_(cols.rate + 1) + row;
-    values[cols.amountUah] = '=IF(OR(' + a + '="",' + r + '=""),"",' + a + '*' + r + ')';
-
-    sheet.getRange(row, 1, 1, width).setValues([values]);
+    sheet.getRange(row, cols.amountUah + 1)
+      .setFormula('=IF(OR(' + a + '="",' + r + '=""),"",' + a + '*' + r + ')');
     SpreadsheetApp.flush();
     return { code: code, row: row };
   } finally {
