@@ -1,59 +1,229 @@
 /**
  * Приймач запитів на оплату → лист «Запити» реєстру запланованих платежів.
  *
- * Етап 1: збирання рядка і запис у таблицю на фіксованих тестових даних.
- * Веб-входу (doPost) тут навмисно ще немає: він з'явиться разом із перевіркою
- * підпису Телеграма, щоб приймач ніколи не був відкритий без неї.
+ * Одна точка входу (doPost): перевірка підпису Телеграма → ліміти → курс НБУ →
+ * новий рядок у «Запити» → сповіщення бухгалтерам і підтвердження контрагенту.
+ * Кожне звернення пишеться в лист «Лог».
  *
- * Властивості скрипта (Project Settings → Script properties):
- *   SHEET_ID — ID таблиці. На етапі тестів — ID КОПІЇ реєстру, не бойового.
+ * Властивості скрипта (Налаштування проєкту → Властивості скрипта):
+ *   SHEET_ID         — ID таблиці реєстру
+ *   BOT_TOKEN        — токен бота
+ *   NOTIFY_CHAT_IDS  — Telegram ID бухгалтерів через кому
+ *   ADMIN_CHAT_ID    — Telegram ID Дмитра (моніторинг)
+ * Необов'язкові:
+ *   WHITELIST_ENABLED   — 'true', щоб пускати лише WHITELIST_IDS (за замовчуванням вимкнено)
+ *   WHITELIST_IDS       — Telegram ID через кому
+ *   RATE_LIMIT_PER_HOUR — за замовчуванням 5
+ *   WEBAPP_URL          — адреса веб-застосунку /exec, якщо setup() не визначить її сам
  */
 
 const SHEET_NAME = 'Запити';
+const LOG_SHEET_NAME = 'Лог';
+const FORM_URL = 'https://dv-coo.github.io/payment-request/';
+const MENU_BUTTON_TEXT = 'Запит на оплату';
+const TZ = 'Europe/Kyiv';
+const CURRENCIES = ['UAH', 'USD', 'EUR', 'PLN', 'USDT'];
+const INIT_DATA_MAX_AGE_SEC = 24 * 3600;
 
-// Назви колонок рівно як у листі «Запити» (рядок 1). Порядок у таблиці не важливий:
-// колонки шукаються за назвою.
+// Назви колонок рівно як у листі «Запити» (рядок 1). Колонки шукаються за назвою.
 const COL = {
-  status:     'Статус',
-  code:       'Код',
-  date:       'Дата',
-  executor:   'Хто проводить',
-  account:    'Рахунок списання',
-  requisites: 'Куди платимо — повні реквізити',
-  amount:     'Сума за домовленістю',
-  currency:   'Валюта',
-  rate:       'Курс',
-  amountUah:  'Сума в ₴',
+  status:       'Статус',
+  code:         'Код',
+  date:         'Дата',
+  executor:     'Хто проводить',
+  account:      'Рахунок списання',
+  requisites:   'Куди платимо — повні реквізити',
+  amount:       'Сума за домовленістю',
+  currency:     'Валюта',
+  rate:         'Курс',
+  amountUah:    'Сума в ₴',
   counterparty: 'Контрагент (як у FM)',
-  category:   'Категорія (як у FM)',
-  project:    'Проєкт',
-  comment:    'Коментар / джерело',
-  contacts:   'Контакти контрагента',
+  category:     'Категорія (як у FM)',
+  project:      'Проєкт',
+  comment:      'Коментар / джерело',
+  contacts:     'Контакти контрагента',
 };
 
-const CURRENCIES = ['UAH', 'USD', 'EUR', 'PLN', 'USDT'];
-const TZ = 'Europe/Kyiv';
+/* ================================ Вхід ================================ */
+
+// Фронт шле text/plain, щоб браузер не робив CORS-preflight, якого Apps Script не обробляє.
+function doPost(e) {
+  let tgId = '';
+  try {
+    const body = JSON.parse(e.postData.contents);
+    const user = verifyInitData_(body.initData, prop_('BOT_TOKEN', true));
+    if (!user) {
+      log_('', 'відхилено', 'підпис Телеграма не сходиться');
+      return json_({ ok: false, error: 'Відкрийте анкету через бот.' });
+    }
+    tgId = String(user.id);
+
+    if (!isAllowed_(tgId)) {
+      log_(tgId, 'відхилено', 'немає в білому списку');
+      return json_({ ok: false, error: 'Доступ до анкети закрито. Зверніться до бухгалтера.' });
+    }
+
+    const recent = recentTimes_(tgId).length;
+    if (recent >= rateLimit_()) {
+      log_(tgId, 'відхилено', 'ліміт запитів за годину');
+      return json_({ ok: false, error: 'Забагато запитів за годину. Спробуйте пізніше.' });
+    }
+
+    let clean;
+    try {
+      clean = validateRequest_(body.form || {});
+    } catch (err) {
+      log_(tgId, 'відхилено', err.message);
+      return json_({ ok: false, error: err.message });
+    }
+
+    const rate = fetchRate_(clean.currency, new Date());
+    const res = appendRequest_(clean, user, rate);
+    rememberRequest_(tgId);
+    log_(tgId, 'прийнято', res.code);
+
+    notifyAccountants_(res.code, clean, user, rate, recent + 1);
+    sendMessage_(user.id, 'Запит прийнято. Код: ' + res.code + '\nБухгалтер отримав сповіщення.');
+
+    return json_({ ok: true, code: res.code });
+  } catch (err) {
+    log_(tgId, 'помилка', String(err && err.stack || err));
+    return json_({ ok: false, error: 'Не вдалося зберегти запит. Спробуйте ще раз за хвилину.' });
+  }
+}
+
+function doGet() {
+  return ContentService.createTextOutput('ok');
+}
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/* ======================== Підпис Телеграма ======================== */
 
 /**
- * Додає один рядок у лист «Запити». Повертає { code, row }.
- *
- * @param {Object} req
- * @param {string} req.name        Ваше ім'я
- * @param {string} req.payDate     Бажана дата оплати, 'YYYY-MM-DD'
- * @param {string} req.purpose     За що оплата
- * @param {number|string} req.amount Сума за домовленістю
- * @param {string} req.currency    UAH | USD | EUR | PLN | USDT
- * @param {string} req.requisites  Повні реквізити
- * @param {Object} tgUser          Перевірений користувач Телеграма { id, username }
- * @param {number|null} rate       Курс (етап 2); null — лишити порожнім
+ * Перевіряє initData міні-застосунку. Повертає об'єкт user або null.
+ * https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
  */
-function appendRequest(req, tgUser, rate) {
-  const clean = validateRequest_(req);
-  const sheet = getSheet_();
+function verifyInitData_(initData, botToken, nowSec) {
+  if (!initData || typeof initData !== 'string') return null;
+  const params = {};
+  initData.split('&').forEach((pair) => {
+    const i = pair.indexOf('=');
+    if (i <= 0) return;
+    params[decodeURIComponent(pair.slice(0, i))] = decodeURIComponent(pair.slice(i + 1).replace(/\+/g, ' '));
+  });
+  const hash = params.hash;
+  if (!hash) return null;
+  delete params.hash;
+
+  const dataCheckString = Object.keys(params).sort().map((k) => k + '=' + params[k]).join('\n');
+  const secret = Utilities.computeHmacSha256Signature(
+    Utilities.newBlob(botToken).getBytes(), Utilities.newBlob('WebAppData').getBytes());
+  const sig = Utilities.computeHmacSha256Signature(Utilities.newBlob(dataCheckString).getBytes(), secret);
+  if (toHex_(sig) !== String(hash).toLowerCase()) return null;
+
+  const now = nowSec || Math.floor(Date.now() / 1000);
+  if (!(now - Number(params.auth_date) < INIT_DATA_MAX_AGE_SEC)) return null;
+
+  try {
+    const user = JSON.parse(params.user);
+    return user && user.id ? user : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function toHex_(bytes) {
+  return bytes.map((b) => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
+
+/* ========================= Доступ і ліміти ========================= */
+
+function isAllowed_(tgId) {
+  if (String(prop_('WHITELIST_ENABLED') || '').toLowerCase() !== 'true') return true;
+  return idList_(prop_('WHITELIST_IDS')).indexOf(tgId) !== -1;
+}
+
+function rateLimit_() {
+  return Number(prop_('RATE_LIMIT_PER_HOUR')) || 5;
+}
+
+function recentTimes_(tgId) {
+  const raw = PropertiesService.getScriptProperties().getProperty('rl_' + tgId);
+  const hourAgo = Date.now() - 3600 * 1000;
+  return (raw ? JSON.parse(raw) : []).filter((t) => t > hourAgo);
+}
+
+function rememberRequest_(tgId) {
+  const times = recentTimes_(tgId);
+  times.push(Date.now());
+  PropertiesService.getScriptProperties().setProperty('rl_' + tgId, JSON.stringify(times));
+}
+
+/* =========================== Валідація =========================== */
+
+function validateRequest_(req) {
+  const text = (v) => (v == null ? '' : String(v)).trim();
+  const out = {
+    name: text(req.name).slice(0, 200),
+    purpose: text(req.purpose).slice(0, 2000),
+    requisites: text(req.requisites).slice(0, 2000),
+    currency: text(req.currency).toUpperCase(),
+  };
+  const missing = [];
+  if (!out.name) missing.push('Ваше ім\'я');
+
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text(req.payDate));
+  if (m) {
+    out.payDate = new Date(+m[1], +m[2] - 1, +m[3]);
+    if (out.payDate.getMonth() !== +m[2] - 1) out.payDate = null;
+  }
+  if (!out.payDate) missing.push('Бажана дата оплати');
+
+  if (!out.purpose) missing.push('За що оплата');
+
+  out.amount = Number(text(req.amount).replace(/\s/g, '').replace(',', '.'));
+  if (!isFinite(out.amount) || out.amount <= 0) missing.push('Сума за домовленістю');
+
+  if (CURRENCIES.indexOf(out.currency) === -1) missing.push('Валюта');
+  if (!out.requisites) missing.push('Куди платимо — повні реквізити');
+
+  if (missing.length) throw new Error('Не заповнено або некоректно: ' + missing.join(', '));
+  return out;
+}
+
+/* ============================ Курс НБУ ============================ */
+
+/** Курс НБУ на дату; якщо на день курсу немає — останній установлений. null, якщо НБУ недоступний. */
+function fetchRate_(currency, date) {
+  if (currency === 'UAH') return 1;
+  const code = currency === 'USDT' ? 'USD' : currency;
+  try {
+    for (let back = 0; back < 7; back++) {
+      const d = new Date(date.getTime() - back * 86400000);
+      const url = 'https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode=' + code +
+        '&date=' + Utilities.formatDate(d, TZ, 'yyyyMMdd') + '&json';
+      const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      if (resp.getResponseCode() !== 200) return null;
+      const data = JSON.parse(resp.getContentText());
+      if (data.length && data[0].rate) return data[0].rate;
+    }
+  } catch (e) {
+    // Недоступність НБУ не блокує запит.
+  }
+  return null;
+}
+
+/* ============================== Запис ============================== */
+
+/** Додає один рядок у лист «Запити». Повертає { code, row }. Наявні рядки не змінює. */
+function appendRequest_(clean, tgUser, rate) {
+  const sheet = getSheet_(SHEET_NAME);
   const cols = mapColumns_(sheet);
 
-  // Лок потрібен, щоб два одночасні запити не отримали однаковий код
-  // і не записались в один рядок.
+  // Лок: два одночасні запити не отримають однаковий код і не запишуться в один рядок.
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
@@ -78,65 +248,12 @@ function appendRequest(req, tgUser, rate) {
     const r = colLetter_(cols.rate + 1) + row;
     values[cols.amountUah] = '=IF(OR(' + a + '="",' + r + '=""),"",' + a + '*' + r + ')';
 
-    // Пишемо тільки в новий рядок під останнім — наявні рядки не чіпаються.
     sheet.getRange(row, 1, 1, width).setValues([values]);
     SpreadsheetApp.flush();
     return { code: code, row: row };
   } finally {
     lock.releaseLock();
   }
-}
-
-function validateRequest_(req) {
-  const text = (v) => (v == null ? '' : String(v)).trim();
-  const out = {
-    name: text(req.name),
-    purpose: text(req.purpose),
-    requisites: text(req.requisites),
-    currency: text(req.currency).toUpperCase(),
-  };
-  const missing = [];
-  if (!out.name) missing.push('Ваше ім\'я');
-  if (!out.purpose) missing.push('За що оплата');
-  if (!out.requisites) missing.push('Куди платимо — повні реквізити');
-
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text(req.payDate));
-  if (m) {
-    out.payDate = new Date(+m[1], +m[2] - 1, +m[3]);
-    if (out.payDate.getMonth() !== +m[2] - 1) out.payDate = null;
-  }
-  if (!out.payDate) missing.push('Бажана дата оплати');
-
-  out.amount = Number(text(req.amount).replace(/\s/g, '').replace(',', '.'));
-  if (!isFinite(out.amount) || out.amount <= 0) missing.push('Сума за домовленістю');
-
-  if (CURRENCIES.indexOf(out.currency) === -1) missing.push('Валюта');
-
-  if (missing.length) throw new Error('Не заповнено або некоректно: ' + missing.join(', '));
-  return out;
-}
-
-function getSheet_() {
-  const id = PropertiesService.getScriptProperties().getProperty('SHEET_ID');
-  if (!id) throw new Error('Не задано властивість скрипта SHEET_ID');
-  const sheet = SpreadsheetApp.openById(id).getSheetByName(SHEET_NAME);
-  if (!sheet) throw new Error('Немає листа «' + SHEET_NAME + '»');
-  return sheet;
-}
-
-/** Повертає { ключ: індекс колонки з 0 } за назвами в рядку 1. */
-function mapColumns_(sheet) {
-  const norm = (s) => String(s).replace(/\s+/g, ' ').trim().toLowerCase();
-  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(norm);
-  const cols = {};
-  const missing = [];
-  Object.keys(COL).forEach((key) => {
-    const i = headers.indexOf(norm(COL[key]));
-    if (i === -1) missing.push(COL[key]);
-    cols[key] = i;
-  });
-  if (missing.length) throw new Error('У листі «' + SHEET_NAME + '» не знайдено колонок: ' + missing.join(', '));
-  return cols;
 }
 
 /** Код R-РРММДД-NN, NN — наступний вільний номер за день подання. */
@@ -154,9 +271,23 @@ function nextCode_(sheet, cols, now) {
 }
 
 function contacts_(tgUser, name) {
-  const handle = tgUser && tgUser.username ? '@' + tgUser.username
-    : 'tg id ' + (tgUser && tgUser.id ? tgUser.id : '?');
+  const handle = tgUser.username ? '@' + tgUser.username : 'tg id ' + tgUser.id;
   return handle + ' ' + name;
+}
+
+/** Повертає { ключ: індекс колонки з 0 } за назвами в рядку 1. */
+function mapColumns_(sheet) {
+  const norm = (s) => String(s).replace(/\s+/g, ' ').trim().toLowerCase();
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(norm);
+  const cols = {};
+  const missing = [];
+  Object.keys(COL).forEach((key) => {
+    const i = headers.indexOf(norm(COL[key]));
+    if (i === -1) missing.push(COL[key]);
+    cols[key] = i;
+  });
+  if (missing.length) throw new Error('У листі «' + SHEET_NAME + '» не знайдено колонок: ' + missing.join(', '));
+  return cols;
 }
 
 function colLetter_(n) {
@@ -169,29 +300,155 @@ function colLetter_(n) {
   return s;
 }
 
-/* ===================== Тести (запускати вручну з редактора) ===================== */
+/* ============================ Телеграм ============================ */
 
-/** Етап 1: додає тестовий рядок у КОПІЮ реєстру. */
-function testStage1_appendRow() {
-  const res = appendRequest({
-    name: 'Тест Тестович',
-    payDate: '2026-10-25',
-    purpose: 'ТЕСТ етап 1 — видалити',
-    amount: '1 500,50',
-    currency: 'USD',
-    requisites: 'IBAN UA00 0000 0000 0000 0000 0000 000, ФОП Тест',
-  }, { id: 111, username: 'test_user' }, 41.5);
-  Logger.log('Записано: %s у рядок %s', res.code, res.row);
+function notifyAccountants_(code, c, user, rate, countThisHour) {
+  const lines = [
+    '🧾 Новий запит на оплату ' + code,
+    'Від: ' + c.name + (user.username ? ' (@' + user.username + ')' : ' (tg id ' + user.id + ')'),
+    'Сума: ' + formatAmount_(c.amount) + ' ' + c.currency,
+    'Бажана дата: ' + Utilities.formatDate(c.payDate, TZ, 'dd.MM.yyyy'),
+    'За що: ' + c.purpose,
+  ];
+  if (rate == null) lines.push('⚠️ Курс НБУ не підтягнувся — поставте вручну.');
+  if (countThisHour > 1) lines.push('ℹ️ Це ' + countThisHour + '-й запит від цієї людини за годину — перевірте на дубль.');
+  idList_(prop_('NOTIFY_CHAT_IDS')).forEach((id) => sendMessage_(id, lines.join('\n')));
 }
 
-/** Етап 1: перевіряє, що неповна анкета відхиляється і нічого не пишеться. */
-function testStage1_rejectsIncomplete() {
+function sendMessage_(chatId, text) {
   try {
-    appendRequest({ name: 'Тест', payDate: '', purpose: '', amount: '', currency: 'XXX', requisites: '' },
-      { id: 111 }, null);
-    throw new Error('ПРОВАЛ: неповна анкета пройшла');
+    telegram_('sendMessage', { chat_id: chatId, text: text, disable_web_page_preview: true });
+    return true;
   } catch (e) {
-    if (String(e.message).indexOf('ПРОВАЛ') === 0) throw e;
-    Logger.log('OK, відхилено: %s', e.message);
+    log_(String(chatId), 'помилка', 'sendMessage: ' + e.message);
+    return false;
   }
+}
+
+function telegram_(method, payload) {
+  const resp = UrlFetchApp.fetch('https://api.telegram.org/bot' + prop_('BOT_TOKEN', true) + '/' + method, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
+  const data = JSON.parse(resp.getContentText());
+  if (!data.ok) throw new Error(method + ': ' + data.description);
+  return data.result;
+}
+
+function formatAmount_(n) {
+  const [int, frac] = n.toFixed(2).split('.');
+  return int.replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + (frac === '00' ? '' : ',' + frac);
+}
+
+/* ============================== Лог ============================== */
+
+function log_(tgId, result, details) {
+  try {
+    getLogSheet_().appendRow([new Date(), tgId, result, String(details || '').slice(0, 1000)]);
+  } catch (e) {
+    console.error('log_ failed', e, tgId, result, details);
+  }
+}
+
+function getLogSheet_() {
+  const ss = SpreadsheetApp.openById(prop_('SHEET_ID', true));
+  let sheet = ss.getSheetByName(LOG_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(LOG_SHEET_NAME);
+    sheet.appendRow(['Час', 'Telegram ID', 'Результат', 'Деталі']);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+/* ========================= Обслуговування ========================= */
+
+/**
+ * Запустити ОДИН раз після публікації веб-застосунку. Робить усе налаштування:
+ * перевіряє колонки, створює «Лог», ставить кнопку в бот, вмикає щоденний моніторинг
+ * і щомісячний бекап, надсилає пробне повідомлення бухгалтерам і адміну.
+ */
+function setup() {
+  mapColumns_(getSheet_(SHEET_NAME));
+  getLogSheet_();
+
+  const url = prop_('WEBAPP_URL') || ScriptApp.getService().getUrl();
+  if (!url || !/\/exec$/.test(url)) {
+    throw new Error('Не вдалося визначити адресу веб-застосунку. Спершу «Розгорнути → Нове розгортання», ' +
+      'або додайте властивість WEBAPP_URL (адреса, що закінчується на /exec).');
+  }
+  telegram_('setChatMenuButton', {
+    menu_button: {
+      type: 'web_app',
+      text: MENU_BUTTON_TEXT,
+      web_app: { url: FORM_URL + '?api=' + encodeURIComponent(url) },
+    },
+  });
+
+  ScriptApp.getProjectTriggers().forEach((t) => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('dailyMonitor').timeBased().everyDays(1).atHour(9).inTimezone(TZ).create();
+  ScriptApp.newTrigger('monthlyBackup').timeBased().onMonthDay(1).atHour(3).inTimezone(TZ).create();
+
+  const failed = idList_(prop_('NOTIFY_CHAT_IDS')).concat(idList_(prop_('ADMIN_CHAT_ID')))
+    .filter((id) => !sendMessage_(id, '✅ Приймач запитів на оплату підключено. Сюди приходитимуть сповіщення.'));
+  if (failed.length) {
+    throw new Error('Кнопку поставлено, але не вдалося написати: ' + failed.join(', ') +
+      '. Ця людина має спершу натиснути «Start» у боті, потім запустіть setup() ще раз.');
+  }
+  Logger.log('Готово. Кнопка «%s» у боті веде на %s', MENU_BUTTON_TEXT, FORM_URL);
+}
+
+/** Щодня: якщо за добу були спроби, але жодна не пройшла, — сповіщення адміну. */
+function dailyMonitor() {
+  const sheet = getLogSheet_();
+  const last = sheet.getLastRow();
+  if (last < 2) return;
+  const since = Date.now() - 86400000;
+  const first = Math.max(2, last - 999);
+  const rows = sheet.getRange(first, 1, last - first + 1, 3).getValues()
+    .filter((r) => r[0] instanceof Date && r[0].getTime() > since);
+  const accepted = rows.filter((r) => r[2] === 'прийнято').length;
+  const errors = rows.filter((r) => r[2] === 'помилка').length;
+  if (rows.length && !accepted) {
+    sendMessage_(prop_('ADMIN_CHAT_ID'), '⚠️ Форма запитів: за добу ' + rows.length +
+      ' спроб, жодна не пройшла (помилок: ' + errors + '). Дивіться лист «Лог».');
+  }
+}
+
+/** Раз на місяць: копія реєстру в папку «Архів реєстру платежів» на Диску. */
+function monthlyBackup() {
+  const props = PropertiesService.getScriptProperties();
+  const folderId = props.getProperty('ARCHIVE_FOLDER_ID');
+  let folder = null;
+  try {
+    if (folderId) folder = DriveApp.getFolderById(folderId);
+  } catch (e) {
+    folder = null;
+  }
+  if (!folder) {
+    folder = DriveApp.createFolder('Архів реєстру платежів');
+    props.setProperty('ARCHIVE_FOLDER_ID', folder.getId());
+  }
+  const file = DriveApp.getFileById(prop_('SHEET_ID', true));
+  file.makeCopy(file.getName() + ' — ' + Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd'), folder);
+}
+
+/* ============================== Утиліти ============================== */
+
+function getSheet_(name) {
+  const sheet = SpreadsheetApp.openById(prop_('SHEET_ID', true)).getSheetByName(name);
+  if (!sheet) throw new Error('Немає листа «' + name + '»');
+  return sheet;
+}
+
+function prop_(key, required) {
+  const v = PropertiesService.getScriptProperties().getProperty(key);
+  if (required && !v) throw new Error('Не задано властивість скрипта ' + key);
+  return v;
+}
+
+function idList_(s) {
+  return String(s || '').split(/[\s,;]+/).filter(Boolean);
 }
