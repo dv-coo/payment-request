@@ -66,73 +66,34 @@
   }
 
   function refresh() {
-    var ok = isValid(values());
-    submit.disabled = !ok;
-    kbSend.hidden = !ok;
+    submit.disabled = !isValid(values());
   }
-
-  /* --------- Клавіатура на телефоні: поле над клавіатурою, панель «Готово / Далі / Надіслати» --------- */
-  var ORDER = ['name', 'payDate', 'purpose', 'amount', 'requisites'];
-  var kbar = document.getElementById('kbar');
-  var kbNext = document.getElementById('kbNext');
-  var kbSend = document.getElementById('kbSend');
-  var current = null;
-
-  function placeBar() {
-    var vv = window.visualViewport;
-    var offset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
-    kbar.style.bottom = offset + 'px';
-  }
-  function showCurrent() {
-    if (!current) return;
-    placeBar();
-    current.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  }
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener('resize', showCurrent);
-    window.visualViewport.addEventListener('scroll', placeBar);
-  }
-  tg.onEvent && tg.onEvent('viewportChanged', showCurrent);
-
-  form.addEventListener('focusin', function (e) {
-    var i = ORDER.indexOf(e.target.name);
-    if (i === -1) return;
-    current = e.target;
-    kbNext.hidden = i === ORDER.length - 1;
-    kbar.hidden = false;
-    document.body.classList.add('kb-open');
-    setTimeout(showCurrent, 350); // після того, як клавіатура виїхала
-  });
-  form.addEventListener('focusout', function () {
-    setTimeout(function () {
-      if (ORDER.indexOf(document.activeElement && document.activeElement.name) !== -1) return;
-      current = null;
-      kbar.hidden = true;
-      document.body.classList.remove('kb-open');
-    }, 120);
-  });
-  // Натискання на панель не має забирати фокус з поля, інакше клавіатура сховається.
-  kbar.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-  function goNext() {
-    var i = current ? ORDER.indexOf(current.name) : -1;
-    if (i !== -1 && i < ORDER.length - 1) f(ORDER[i + 1]).focus();
-    else if (current) current.blur();
-  }
-  kbNext.addEventListener('click', goNext);
-  document.getElementById('kbDone').addEventListener('click', function () { if (current) current.blur(); });
-  kbSend.addEventListener('click', function () {
-    if (current) current.blur();
-    submit.click();
-  });
-  // «Далі» на самій клавіатурі для однорядкових полів.
-  ['name', 'amount'].forEach(function (n) {
-    f(n).addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') { e.preventDefault(); goNext(); }
-    });
-  });
   form.addEventListener('input', refresh);
   form.addEventListener('change', refresh);
   refresh();
+
+  /* ---- Клавіатура на телефоні: активне поле лишається видимим над клавіатурою ---- */
+  var current = null;
+
+  function showCurrent() {
+    if (current) current.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', showCurrent);
+  tg.onEvent && tg.onEvent('viewportChanged', showCurrent);
+
+  form.addEventListener('focusin', function (e) {
+    if (!/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+    current = e.target;
+    setTimeout(showCurrent, 350); // після того, як клавіатура виїхала
+  });
+  form.addEventListener('focusout', function () { current = null; });
+
+  // Натискання повз поле ховає клавіатуру; набране лишається — поле не очищується.
+  document.addEventListener('pointerdown', function (e) {
+    if (!current || current.contains(e.target)) return;
+    if (/^(INPUT|TEXTAREA|BUTTON|SELECT|LABEL|SUMMARY)$/.test(e.target.tagName)) return;
+    current.blur();
+  });
 
   var sending = false;
   form.addEventListener('submit', function (e) {
