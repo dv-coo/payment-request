@@ -11,6 +11,7 @@
  *   SHEET_ID         — ID таблиці реєстру
  *   BOT_TOKEN        — токен бота
  *   ADMIN_CHAT_ID    — Telegram ID Дмитра: сповіщення про запити й моніторинг
+ *   FINMAP_TOKEN     — ключ API FinMap (заголовок apiKey) для списку категорій
  * Необов'язкові:
  *   NOTIFY_CHAT_IDS     — кому ще слати сповіщення про запити, ID через кому
  *   WHITELIST_ENABLED   — 'true', щоб пускати лише WHITELIST_IDS (за замовчуванням вимкнено)
@@ -26,6 +27,9 @@ const MENU_BUTTON_TEXT = 'Запит на оплату';
 const TZ = 'Europe/Kyiv';
 const CURRENCIES = ['UAH', 'USD', 'EUR', 'PLN', 'USDT'];
 const INIT_DATA_MAX_AGE_SEC = 24 * 3600;
+const FINMAP_EXPENSE_CATEGORIES_URL = 'https://api.finmap.online/v2.2/categories/expense';
+const DICT_SHEET_NAME = 'Довідники';
+const ARCHIVE_PREFIX = '[Архів]';
 
 // Опис бота — його видно в порожньому чаті ще до «Start» (до 512 символів).
 const BOT_DESCRIPTION =
@@ -116,7 +120,7 @@ function doPost(e) {
   }
 }
 
-const VERSION = '2026-10-20.1';
+const VERSION = '2026-10-21.1';
 
 // Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
@@ -497,6 +501,7 @@ function setup() {
   });
 
   ScriptApp.getProjectTriggers().forEach((t) => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('syncCategories').timeBased().everyDays(1).atHour(8).inTimezone(TZ).create();
   ScriptApp.newTrigger('dailyMonitor').timeBased().everyDays(1).atHour(9).inTimezone(TZ).create();
   ScriptApp.newTrigger('monthlyBackup').timeBased().onMonthDay(1).atHour(3).inTimezone(TZ).create();
 
@@ -505,6 +510,9 @@ function setup() {
   if (failed.length) {
     throw new Error('Бот налаштовано, але не вдалося написати: ' + failed.join(', ') +
       '. Спершу натисніть «Start» у боті, потім запустіть setup() ще раз.');
+  }
+  if (!syncCategories()) {
+    throw new Error('Бот налаштовано, але категорії з FinMap не підтягнулися. Дивіться лист «Лог».');
   }
   Logger.log('Готово. Бот налаштовано, кнопка «%s» веде на %s', MENU_BUTTON_TEXT, FORM_URL);
 }
@@ -542,6 +550,66 @@ function monthlyBackup() {
   }
   const file = DriveApp.getFileById(prop_('SHEET_ID', true));
   file.makeCopy(file.getName() + ' — ' + Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd'), folder);
+}
+
+/* ============================== FinMap ============================== */
+
+/**
+ * Оновлює спадне меню «Категорія (як у FM)» списком витратних категорій з FinMap.
+ * Без системних і без [Архів]; разові події з минулими датами лишаються.
+ * Список лежить у прихованому аркуші «Довідники». Якщо FinMap не відповів —
+ * лишається попередній список, причина йде в «Лог». Повертає кількість категорій (0 — помилка).
+ */
+function syncCategories() {
+  let labels;
+  try {
+    labels = fetchExpenseCategoryLabels_();
+  } catch (e) {
+    log_('', 'помилка', 'FinMap категорії: ' + e.message);
+    return 0;
+  }
+  const ss = SpreadsheetApp.openById(prop_('SHEET_ID', true));
+  let dict = ss.getSheetByName(DICT_SHEET_NAME);
+  if (!dict) {
+    dict = ss.insertSheet(DICT_SHEET_NAME);
+    dict.hideSheet();
+  }
+  dict.clearContents();
+  dict.getRange(1, 1, labels.length, 1).setValues(labels.map((l) => [l]));
+  applyCategoryValidation_(getSheet_(SHEET_NAME), dict, labels.length);
+  return labels.length;
+}
+
+function fetchExpenseCategoryLabels_() {
+  const resp = UrlFetchApp.fetch(FINMAP_EXPENSE_CATEGORIES_URL, {
+    method: 'get',
+    headers: { apiKey: prop_('FINMAP_TOKEN', true), Accept: 'application/json' },
+    muteHttpExceptions: true,
+  });
+  if (resp.getResponseCode() !== 200) {
+    throw new Error('код ' + resp.getResponseCode() + ': ' + resp.getContentText().slice(0, 200));
+  }
+  const labels = JSON.parse(resp.getContentText())
+    .filter((c) => !c.isSystem)
+    .map((c) => String(c.label || '').replace(/\s+/g, ' ').trim())
+    .filter((l) => l && l.indexOf(ARCHIVE_PREFIX) !== 0);
+  const unique = [...new Set(labels)];
+  if (!unique.length) throw new Error('FinMap повернув порожній список категорій');
+  return unique.sort((a, b) => a.localeCompare(b, 'uk'));
+}
+
+/**
+ * Спадне меню в колонці категорії, з другого рядка. Вводити можна й вручну:
+ * значення поза списком дає попередження, а не помилку.
+ */
+function applyCategoryValidation_(sheet, dict, count) {
+  const cols = mapColumns_(sheet);
+  const rows = Math.max(1, sheet.getMaxRows() - 1);
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(dict.getRange(1, 1, count, 1), true)
+    .setAllowInvalid(true)
+    .build();
+  sheet.getRange(2, cols.category + 1, rows, 1).setDataValidation(rule);
 }
 
 /* ============================== Утиліти ============================== */
