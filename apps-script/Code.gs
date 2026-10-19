@@ -19,6 +19,7 @@
  *   WHITELIST_IDS       — Telegram ID через кому
  *   RATE_LIMIT_PER_HOUR — за замовчуванням 5
  *   WEBAPP_URL          — адреса веб-застосунку /exec, якщо setup() не визначить її сам
+ *   DEFAULT_PROJECT     — проєкт для нових запитів (за замовчуванням DEFAULT_PROJECT нижче)
  */
 
 const SHEET_NAME = 'Запити';
@@ -33,6 +34,12 @@ const INIT_DATA_MAX_AGE_SEC = 24 * 3600;
 const FINMAP_API = 'https://api.finmap.online/v2.2';
 const DICT_SHEET_NAME = 'Довідники';
 const ARCHIVE_PREFIX = '[Архів]';
+const DEFAULT_PROJECT = 'Вища Ліга 6.0';
+// Завершені проєкти, які у FinMap не позначені [Архів]. Нові проєкти з'являтимуться в меню самі.
+const HIDDEN_PROJECTS = [
+  'Вища Ліга 2.0', 'Вища Ліга 3.0', 'Вища Ліга 4.0',
+  'Кредитование ВЛ 3.0', 'Кредитование ВЛ 4.0', 'Ліга Інфобізнесу',
+];
 
 // Опис бота — його видно в порожньому чаті ще до «Start» (до 512 символів).
 const BOT_DESCRIPTION =
@@ -125,7 +132,7 @@ function doPost(e) {
   }
 }
 
-const VERSION = '2026-10-21.3';
+const VERSION = '2026-10-22.1';
 
 // Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
@@ -281,8 +288,10 @@ function appendRequest_(clean, tgUser, rate, fmName) {
     values[cols.rate] = rate == null ? '' : rate;
     values[cols.counterparty] = fmName || ''; // ім'я як у FinMap; як написала людина — у «Контактах»
     values[cols.comment] = clean.purpose;
-    values[cols.contacts] = contacts_(tgUser, clean.name);
-    // Статус, Хто проводить, Рахунок списання, Категорія, Проєкт — порожні.
+    const contact = contacts_(tgUser, clean.name);
+    values[cols.contacts] = contact.text;
+    values[cols.project] = prop_('DEFAULT_PROJECT') || DEFAULT_PROJECT; // у меню можна змінити
+    // Статус, Хто проводить, Рахунок списання, Категорія — порожні.
 
     sheet.getRange(row, 1, 1, width).setValues([values]);
 
@@ -292,6 +301,13 @@ function appendRequest_(clean, tgUser, rate, fmName) {
     const a = colLetter_(cols.amount + 1) + row;
     const r = colLetter_(cols.rate + 1) + row;
     sheet.getRange(row, cols.amountUah + 1).setFormula('=IFERROR(' + a + '*' + r + '/(' + r + '<>""))');
+    if (contact.url) {
+      // Посилання в клітинці: клік відкриває чат з людиною в Телеграмі.
+      sheet.getRange(row, cols.contacts + 1).setRichTextValue(SpreadsheetApp.newRichTextValue()
+        .setText(contact.text)
+        .setLinkUrl(contact.text.length - contact.url.length, contact.text.length, contact.url)
+        .build());
+    }
     SpreadsheetApp.flush();
     return { code: code, row: row };
   } finally {
@@ -313,9 +329,14 @@ function nextCode_(sheet, cols, now) {
   return prefix + String(max + 1).padStart(2, '0');
 }
 
+/**
+ * Ім'я як написала людина + посилання на чат з нею. Без ніка в Телеграмі посилання на чат
+ * не буває — тоді лише Telegram ID.
+ */
 function contacts_(tgUser, name) {
-  const handle = tgUser.username ? '@' + tgUser.username : 'tg id ' + tgUser.id;
-  return handle + ' ' + name;
+  if (!tgUser.username) return { text: name + ' — tg id ' + tgUser.id, url: '' };
+  const url = 'https://t.me/' + tgUser.username;
+  return { text: name + ' — ' + url, url: url };
 }
 
 /** Повертає { ключ: індекс колонки з 0 } за назвами в рядку 1. */
@@ -579,7 +600,7 @@ function monthlyBackup() {
 const DICTS = [
   { key: 'category',     title: 'Категорії',   paths: ['/categories/expense'] },
   { key: 'account',      title: 'Рахунки',     paths: ['/accounts'] },
-  { key: 'project',      title: 'Проєкти',     paths: ['/projects'] },
+  { key: 'project',      title: 'Проєкти',     paths: ['/projects'], hide: HIDDEN_PROJECTS },
   { key: 'counterparty', title: 'Контрагенти', paths: ['/suppliers', '/employees', '/owners', '/creditors'] },
 ];
 
@@ -599,7 +620,7 @@ function syncDictionaries() {
   const errors = [];
   DICTS.forEach((d, i) => {
     try {
-      const labels = finmapLabels_(d.paths);
+      const labels = finmapLabels_(d.paths, d.hide);
       if (dict.getMaxRows() < labels.length + 1) {
         dict.insertRowsAfter(dict.getMaxRows(), labels.length + 1 - dict.getMaxRows());
       }
@@ -619,8 +640,8 @@ function syncDictionaries() {
   return { counts: counts, errors: errors };
 }
 
-/** Назви зі списків FinMap: без системних і [Архів], без дублів, за алфавітом. */
-function finmapLabels_(paths) {
+/** Назви зі списків FinMap: без системних, [Архів] і прихованих (hide), без дублів, за алфавітом. */
+function finmapLabels_(paths, hide) {
   const labels = [];
   paths.forEach((path, i) => {
     const resp = UrlFetchApp.fetch(FINMAP_API + path, {
@@ -633,7 +654,9 @@ function finmapLabels_(paths) {
     }
     JSON.parse(resp.getContentText()).forEach((item) => {
       const label = String(item.label || '').replace(/\s+/g, ' ').trim();
-      if (label && !item.isSystem && label.indexOf(ARCHIVE_PREFIX) !== 0) labels.push(label);
+      if (label && !item.isSystem && label.indexOf(ARCHIVE_PREFIX) !== 0 && (hide || []).indexOf(label) === -1) {
+        labels.push(label);
+      }
     });
   });
   const unique = [...new Set(labels)];
