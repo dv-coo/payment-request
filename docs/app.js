@@ -7,7 +7,11 @@
   var errorBox = document.getElementById('error');
   function f(name) { return form.elements.namedItem(name); }
 
-  if (!tg || !tg.initData || !api) {
+  // Відкрито з великої кнопки внизу чату: Телеграм не дає таким анкетам initData,
+  // тому дані йдуть через tg.sendData — повідомленням у чат від імені людини.
+  var inTelegram = !!(tg && tg.platform && tg.platform !== 'unknown');
+  var viaKeyboard = inTelegram && !tg.initData;
+  if (!inTelegram || (!viaKeyboard && !api)) {
     form.hidden = true;
     document.getElementById('outside').hidden = false;
     return;
@@ -69,6 +73,21 @@
     submit.disabled = true;
     submit.textContent = 'Надсилаємо…';
     errorBox.hidden = true;
+
+    if (viaKeyboard) {
+      var payload = JSON.stringify(v);
+      // Телеграм приймає до 4096 байт; кирилиця — 2 байти на літеру.
+      if (new TextEncoder().encode(payload).length > 4000) {
+        errorBox.textContent = 'Задовгий текст. Скоротіть «За що оплата» або реквізити.';
+        errorBox.hidden = false;
+        sending = false;
+        submit.textContent = 'Надіслати';
+        refresh();
+        return;
+      }
+      tg.sendData(payload); // анкета закриється, код запиту бот пришле в чат
+      return;
+    }
 
     // text/plain — без CORS-preflight, якого Apps Script не обробляє.
     fetch(api, {

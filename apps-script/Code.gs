@@ -28,6 +28,7 @@ const OLD_LOG_SHEET_NAME = 'Лог'; // назва з першої версії 
 const SYSTEM_LOG_ID = 'система'; // службові записи (довідники тощо), не звернення людей
 const FORM_URL = 'https://dv-coo.github.io/payment-request/';
 const MENU_BUTTON_TEXT = 'Запит на оплату';
+const KEYBOARD_BUTTON_TEXT = '📝 Запит на оплату';
 const TZ = 'Europe/Kyiv';
 const CURRENCIES = ['UAH', 'USD', 'EUR', 'PLN', 'USDT'];
 const INIT_DATA_MAX_AGE_SEC = 24 * 3600;
@@ -54,13 +55,14 @@ const BOT_SHORT_DESCRIPTION = 'Запити на оплату для підря�
 const START_TEXT =
   '👋 Вітаю! Тут подають запити на оплату для APEX.\n\n' +
   'Як це працює:\n' +
-  '1. Натисніть кнопку «📝 Подати запит» нижче (або «' + MENU_BUTTON_TEXT + '» біля поля вводу).\n' +
+  '1. Натисніть велику кнопку «' + KEYBOARD_BUTTON_TEXT + '» внизу екрана.\n' +
   '2. Заповніть 6 полів: ім\'я, бажана дата оплати, за що, сума, валюта і повні реквізити.\n' +
   '3. Натисніть «Надіслати». Ви отримаєте код запиту — збережіть його.\n\n' +
   'Запит одразу потрапляє до бухгалтера. Кожен окремий платіж — окремий запит.\n' +
   'Писати в цей чат не потрібно: повідомлення не читаються.';
 
-const NO_CHAT_TEXT = 'Цей бот не приймає повідомлень. Щоб передати запит на оплату — натисніть кнопку нижче.';
+const NO_CHAT_TEXT = 'Цей бот не приймає повідомлень. Щоб передати запит на оплату — натисніть кнопку «' +
+  KEYBOARD_BUTTON_TEXT + '» внизу екрана.';
 
 // Назви колонок рівно як у листі «Запити» (рядок 1). Колонки шукаються за назвою.
 const COL = {
@@ -86,7 +88,6 @@ const COL = {
 // Фронт шле text/plain, щоб браузер не робив CORS-preflight, якого Apps Script не обробляє.
 function doPost(e) {
   if (e.parameter && e.parameter.tg) return handleBotUpdate_(e);
-  let tgId = '';
   try {
     const body = JSON.parse(e.postData.contents);
     const user = verifyInitData_(body.initData, prop_('BOT_TOKEN', true));
@@ -94,26 +95,39 @@ function doPost(e) {
       log_('', 'відхилено', 'підпис Телеграма не сходиться');
       return json_({ ok: false, error: 'Відкрийте анкету через бот.' });
     }
-    tgId = String(user.id);
+    return json_(handleSubmission_(user, body.form || {}));
+  } catch (err) {
+    log_('', 'помилка', String(err && err.stack || err));
+    return json_({ ok: false, error: 'Не вдалося зберегти запит. Спробуйте ще раз за хвилину.' });
+  }
+}
 
+/**
+ * Обробляє анкету від уже перевіреного користувача Телеграма — однаково для анкети,
+ * відкритої з кнопки меню/«Відкрити» (підпис initData), і з великої кнопки внизу чату
+ * (дані приходять від Телеграма повідомленням у вебхук). Повертає { ok, code } або { ok, error }.
+ */
+function handleSubmission_(user, form) {
+  const tgId = String(user.id);
+  try {
     if (!isAllowed_(tgId)) {
       log_(tgId, 'відхилено', 'немає в білому списку');
-      return json_({ ok: false, error: 'Доступ до анкети закрито. Зверніться до бухгалтера.' });
+      return { ok: false, error: 'Доступ до анкети закрито. Зверніться до бухгалтера.' };
     }
 
     const recent = recentTimes_(tgId).length;
     const isAdmin = idList_(prop_('ADMIN_CHAT_ID')).indexOf(tgId) !== -1; // адміну ліміт не потрібен
     if (!isAdmin && recent >= rateLimit_()) {
       log_(tgId, 'відхилено', 'ліміт запитів за годину');
-      return json_({ ok: false, error: 'Забагато запитів за годину. Спробуйте пізніше.' });
+      return { ok: false, error: 'Забагато запитів за годину. Спробуйте пізніше.' };
     }
 
     let clean;
     try {
-      clean = validateRequest_(body.form || {});
+      clean = validateRequest_(form);
     } catch (err) {
       log_(tgId, 'відхилено', err.message);
-      return json_({ ok: false, error: err.message });
+      return { ok: false, error: err.message };
     }
 
     const rate = fetchRate_(clean.currency, new Date());
@@ -124,15 +138,14 @@ function doPost(e) {
 
     notifyAccountants_(res.code, clean, user, rate, recent + 1, fmName);
     sendMessage_(user.id, 'Запит прийнято. Код: ' + res.code + '\nБухгалтер отримав сповіщення.');
-
-    return json_({ ok: true, code: res.code });
+    return { ok: true, code: res.code };
   } catch (err) {
     log_(tgId, 'помилка', String(err && err.stack || err));
-    return json_({ ok: false, error: 'Не вдалося зберегти запит. Спробуйте ще раз за хвилину.' });
+    return { ok: false, error: 'Не вдалося зберегти запит. Спробуйте ще раз за хвилину.' };
   }
 }
 
-const VERSION = '2026-10-22.2';
+const VERSION = '2026-10-22.3';
 
 // Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
@@ -386,8 +399,21 @@ function handleBotUpdate_(e) {
     if (!msg || !msg.chat || msg.chat.type !== 'private') return ok;
     const chatId = msg.chat.id;
 
+    // Анкета з великої кнопки внизу чату: дані приходять від Телеграма від імені цієї людини.
+    if (msg.web_app_data) {
+      let form = {};
+      try {
+        form = JSON.parse(msg.web_app_data.data);
+      } catch (err) {
+        form = {};
+      }
+      const res = handleSubmission_(msg.from, form);
+      if (!res.ok) sendWithKeyboard_(chatId, '❌ ' + res.error + '\nСпробуйте ще раз — кнопка «' + KEYBOARD_BUTTON_TEXT + '» внизу.');
+      return ok;
+    }
+
     if (/^\/start\b/.test(msg.text || '')) {
-      sendWithFormButton_(chatId, START_TEXT);
+      sendWithKeyboard_(chatId, START_TEXT);
       return ok;
     }
 
@@ -400,7 +426,7 @@ function handleBotUpdate_(e) {
     const hintKey = 'hint_' + chatId;
     if (!cache.get(hintKey)) {
       cache.put(hintKey, '1', 600);
-      sendWithFormButton_(chatId, NO_CHAT_TEXT);
+      sendWithKeyboard_(chatId, NO_CHAT_TEXT);
     }
   } catch (err) {
     log_(SYSTEM_LOG_ID, 'помилка', 'бот: ' + (err && err.message || err));
@@ -408,16 +434,23 @@ function handleBotUpdate_(e) {
   return ok;
 }
 
-function sendWithFormButton_(chatId, text) {
+/** Повідомлення з великою кнопкою анкети на всю ширину внизу чату (лишається постійно). */
+function sendWithKeyboard_(chatId, text) {
   try {
-    telegram_('sendMessage', {
-      chat_id: chatId,
-      text: text,
-      reply_markup: { inline_keyboard: [[{ text: '📝 Подати запит', web_app: { url: formUrl_() } }]] },
-    });
+    telegram_('sendMessage', { chat_id: chatId, text: text, reply_markup: formKeyboard_() });
+    return true;
   } catch (err) {
     log_(String(chatId), 'помилка', 'sendMessage: ' + err.message);
+    return false;
   }
+}
+
+function formKeyboard_() {
+  return {
+    keyboard: [[{ text: KEYBOARD_BUTTON_TEXT, web_app: { url: formUrl_() } }]],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
 }
 
 /** Адреса цього веб-застосунку (…/exec). */
@@ -545,7 +578,7 @@ function setup() {
   ScriptApp.newTrigger('monthlyBackup').timeBased().onMonthDay(1).atHour(3).inTimezone(TZ).create();
 
   const failed = recipients_()
-    .filter((id) => !sendMessage_(id, '✅ Приймач запитів на оплату підключено. Сюди приходитимуть сповіщення.'));
+    .filter((id) => !sendWithKeyboard_(id, '✅ Приймач запитів на оплату підключено. Сюди приходитимуть сповіщення.'));
   if (failed.length) {
     throw new Error('Бот налаштовано, але не вдалося написати: ' + failed.join(', ') +
       '. Спершу натисніть «Start» у боті, потім запустіть setup() ще раз.');
@@ -555,6 +588,7 @@ function setup() {
     throw new Error('Бот налаштовано, але не всі довідники з FinMap підтягнулися: ' + sync.errors.join('; '));
   }
   Logger.log('Готово. Довідники з FinMap: %s', JSON.stringify(sync.counts));
+  Logger.log('Адреса анкети для BotFather → Configure Mini App: %s', form);
 }
 
 /** Щодня: якщо за добу були спроби, але жодна не пройшла, — сповіщення адміну. */
