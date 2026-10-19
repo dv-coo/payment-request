@@ -1,9 +1,11 @@
 /**
  * Приймач запитів на оплату → лист «Запити» реєстру запланованих платежів.
  *
- * Одна точка входу (doPost): перевірка підпису Телеграма → ліміти → курс НБУ →
- * новий рядок у «Запити» → сповіщення бухгалтерам і підтвердження контрагенту.
- * Кожне звернення пишеться в лист «Лог».
+ * Одна точка входу (doPost), два види звернень:
+ *  - анкета: перевірка підпису Телеграма → ліміти → курс НБУ → новий рядок у «Запити» →
+ *    сповіщення й підтвердження контрагенту. Кожне звернення пишеться в лист «Лог»;
+ *  - вебхук бота (?tg=секрет): на /start — інструкція з кнопкою анкети, будь-яке інше
+ *    повідомлення видаляється, бот лише нагадує про кнопку. Чат з ботом не для листування.
  *
  * Властивості скрипта (Налаштування проєкту → Властивості скрипта):
  *   SHEET_ID         — ID таблиці реєстру
@@ -24,6 +26,27 @@ const MENU_BUTTON_TEXT = 'Запит на оплату';
 const TZ = 'Europe/Kyiv';
 const CURRENCIES = ['UAH', 'USD', 'EUR', 'PLN', 'USDT'];
 const INIT_DATA_MAX_AGE_SEC = 24 * 3600;
+
+// Опис бота — його видно в порожньому чаті ще до «Start» (до 512 символів).
+const BOT_DESCRIPTION =
+  'Бот для запитів на оплату APEX — для підрядників і членів команди.\n\n' +
+  'Як подати запит:\n' +
+  '1. Натисніть «Start», потім «' + MENU_BUTTON_TEXT + '».\n' +
+  '2. Заповніть анкету: ім\'я, бажана дата, за що, сума, валюта, реквізити.\n' +
+  '3. Натисніть «Надіслати» — отримаєте код запиту.\n\n' +
+  'Запит одразу потрапляє до бухгалтера. Писати в чат не потрібно.';
+const BOT_SHORT_DESCRIPTION = 'Запити на оплату для підрядників і команди APEX. Подача — через анкету, за 1 хвилину.';
+
+const START_TEXT =
+  '👋 Вітаю! Тут подають запити на оплату для APEX.\n\n' +
+  'Як це працює:\n' +
+  '1. Натисніть кнопку «📝 Подати запит» нижче (або «' + MENU_BUTTON_TEXT + '» біля поля вводу).\n' +
+  '2. Заповніть 6 полів: ім\'я, бажана дата оплати, за що, сума, валюта і повні реквізити.\n' +
+  '3. Натисніть «Надіслати». Ви отримаєте код запиту — збережіть його.\n\n' +
+  'Запит одразу потрапляє до бухгалтера. Кожен окремий платіж — окремий запит.\n' +
+  'Писати в цей чат не потрібно: повідомлення не читаються.';
+
+const NO_CHAT_TEXT = 'Цей бот не приймає повідомлень. Щоб передати запит на оплату — натисніть кнопку нижче.';
 
 // Назви колонок рівно як у листі «Запити» (рядок 1). Колонки шукаються за назвою.
 const COL = {
@@ -48,6 +71,7 @@ const COL = {
 
 // Фронт шле text/plain, щоб браузер не робив CORS-preflight, якого Apps Script не обробляє.
 function doPost(e) {
+  if (e.parameter && e.parameter.tg) return handleBotUpdate_(e);
   let tgId = '';
   try {
     const body = JSON.parse(e.postData.contents);
@@ -303,6 +327,76 @@ function colLetter_(n) {
   return s;
 }
 
+/* ======================== Вебхук бота ======================== */
+
+/**
+ * Оновлення від Телеграма. Apps Script не бачить заголовків, тому справжність перевіряємо
+ * секретом у адресі вебхука. Телеграм отримує від Apps Script редирект замість 200 і може
+ * повторити те саме оновлення — тому дедуплікація за update_id.
+ */
+function handleBotUpdate_(e) {
+  const ok = ContentService.createTextOutput('ok');
+  try {
+    if (e.parameter.tg !== prop_('TG_WEBHOOK_SECRET')) return ok;
+    const update = JSON.parse(e.postData.contents);
+    const cache = CacheService.getScriptCache();
+    const seenKey = 'upd_' + update.update_id;
+    if (cache.get(seenKey)) return ok;
+    cache.put(seenKey, '1', 21600);
+
+    const msg = update.message;
+    if (!msg || !msg.chat || msg.chat.type !== 'private') return ok;
+    const chatId = msg.chat.id;
+
+    if (/^\/start\b/.test(msg.text || '')) {
+      sendWithFormButton_(chatId, START_TEXT);
+      return ok;
+    }
+
+    // Будь-що інше — прибираємо з чату; нагадування не частіше разу на 10 хв.
+    try {
+      telegram_('deleteMessage', { chat_id: chatId, message_id: msg.message_id });
+    } catch (err) {
+      // Не вдалося видалити (напр., службове повідомлення) — не страшно.
+    }
+    const hintKey = 'hint_' + chatId;
+    if (!cache.get(hintKey)) {
+      cache.put(hintKey, '1', 600);
+      sendWithFormButton_(chatId, NO_CHAT_TEXT);
+    }
+  } catch (err) {
+    log_('', 'помилка', 'бот: ' + (err && err.message || err));
+  }
+  return ok;
+}
+
+function sendWithFormButton_(chatId, text) {
+  try {
+    telegram_('sendMessage', {
+      chat_id: chatId,
+      text: text,
+      reply_markup: { inline_keyboard: [[{ text: '📝 Подати запит', web_app: { url: formUrl_() } }]] },
+    });
+  } catch (err) {
+    log_(String(chatId), 'помилка', 'sendMessage: ' + err.message);
+  }
+}
+
+/** Адреса цього веб-застосунку (…/exec). */
+function execUrl_() {
+  const url = prop_('WEBAPP_URL') || ScriptApp.getService().getUrl();
+  if (!url || !/\/exec$/.test(url)) {
+    throw new Error('Не вдалося визначити адресу веб-застосунку. Спершу «Розгорнути → Нове розгортання», ' +
+      'або додайте властивість WEBAPP_URL (адреса, що закінчується на /exec).');
+  }
+  return url;
+}
+
+/** Адреса анкети з параметром api — куди анкета шле дані. */
+function formUrl_() {
+  return FORM_URL + '?api=' + encodeURIComponent(execUrl_());
+}
+
 /* ============================ Телеграм ============================ */
 
 function notifyAccountants_(code, c, user, rate, countThisHour) {
@@ -377,17 +471,27 @@ function setup() {
   mapColumns_(getSheet_(SHEET_NAME));
   getLogSheet_();
 
-  const url = prop_('WEBAPP_URL') || ScriptApp.getService().getUrl();
-  if (!url || !/\/exec$/.test(url)) {
-    throw new Error('Не вдалося визначити адресу веб-застосунку. Спершу «Розгорнути → Нове розгортання», ' +
-      'або додайте властивість WEBAPP_URL (адреса, що закінчується на /exec).');
-  }
+  const form = formUrl_();
+
+  // Профіль бота: опис до «Start», без списку команд, кнопка анкети біля поля вводу.
+  telegram_('setMyDescription', { description: BOT_DESCRIPTION });
+  telegram_('setMyShortDescription', { short_description: BOT_SHORT_DESCRIPTION });
+  telegram_('deleteMyCommands', {});
   telegram_('setChatMenuButton', {
-    menu_button: {
-      type: 'web_app',
-      text: MENU_BUTTON_TEXT,
-      web_app: { url: FORM_URL + '?api=' + encodeURIComponent(url) },
-    },
+    menu_button: { type: 'web_app', text: MENU_BUTTON_TEXT, web_app: { url: form } },
+  });
+
+  // Вебхук: бот відповідає на /start і прибирає інші повідомлення.
+  const props = PropertiesService.getScriptProperties();
+  let secret = props.getProperty('TG_WEBHOOK_SECRET');
+  if (!secret) {
+    secret = Utilities.getUuid().replace(/-/g, '');
+    props.setProperty('TG_WEBHOOK_SECRET', secret);
+  }
+  telegram_('setWebhook', {
+    url: execUrl_() + '?tg=' + secret,
+    allowed_updates: ['message'],
+    drop_pending_updates: true,
   });
 
   ScriptApp.getProjectTriggers().forEach((t) => ScriptApp.deleteTrigger(t));
@@ -397,10 +501,10 @@ function setup() {
   const failed = recipients_()
     .filter((id) => !sendMessage_(id, '✅ Приймач запитів на оплату підключено. Сюди приходитимуть сповіщення.'));
   if (failed.length) {
-    throw new Error('Кнопку поставлено, але не вдалося написати: ' + failed.join(', ') +
+    throw new Error('Бот налаштовано, але не вдалося написати: ' + failed.join(', ') +
       '. Спершу натисніть «Start» у боті, потім запустіть setup() ще раз.');
   }
-  Logger.log('Готово. Кнопка «%s» у боті веде на %s', MENU_BUTTON_TEXT, FORM_URL);
+  Logger.log('Готово. Бот налаштовано, кнопка «%s» веде на %s', MENU_BUTTON_TEXT, FORM_URL);
 }
 
 /** Щодня: якщо за добу були спроби, але жодна не пройшла, — сповіщення адміну. */

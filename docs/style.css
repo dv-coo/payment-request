@@ -107,3 +107,20 @@ input:focus, textarea:focus { border-color: var(--focus); }
 }
 .code { font-size: 26px; font-weight: 700; letter-spacing: 0.02em; margin: 0 0 8px; }
 .done .btn { margin-top: 12px; }
+
+.howto { margin-bottom: 12px; padding: 0; }
+.howto summary {
+  cursor: pointer;
+  list-style: none;
+  font-weight: 600;
+  font-size: 15px;
+  padding: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.howto summary::-webkit-details-marker { display: none; }
+.howto summary::after { content: "+"; font-size: 22px; line-height: 1; }
+.howto[open] summary::after { content: "–"; }
+.howto ol { margin: 0; padding: 0 16px 16px 36px; font-size: 14px; line-height: 1.45; }
+.howto li + li { margin-top: 8px; }

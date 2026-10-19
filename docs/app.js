@@ -12,6 +12,15 @@
     document.getElementById('outside').hidden = false;
     return;
   }
+  // Перший раз інструкцію розгорнуто, далі — згорнуто.
+  try {
+    if (!localStorage.getItem('howtoSeen')) {
+      document.getElementById('howto').open = true;
+      localStorage.setItem('howtoSeen', '1');
+    }
+  } catch (e) {
+    document.getElementById('howto').open = true;
+  }
   tg.ready();
   tg.expand();
   tg.setHeaderColor && tg.setHeaderColor('#e2ecf4');
