@@ -26,6 +26,9 @@ const SHEET_NAME = 'Запити';
 const LOG_SHEET_NAME = 'Історія змін';
 const OLD_LOG_SHEET_NAME = 'Лог'; // назва з першої версії — перейменовується автоматично
 const SYSTEM_LOG_ID = 'система'; // службові записи (довідники тощо), не звернення людей
+const SEEN_PREFIX = 'seen_';     // позначки оброблених оновлень Телеграма
+const SEEN_KEEP_DAYS = 4;        // довше, ніж Телеграм повторює невдалу доставку
+const DOUBLE_TAP_SEC = 600;      // той самий запит двічі поспіль — друге ігноруємо
 const FORM_URL = 'https://dv-coo.github.io/payment-request/';
 const MENU_BUTTON_TEXT = 'Запит на оплату';
 const KEYBOARD_BUTTON_TEXT = '📝 Запит на оплату';
@@ -145,7 +148,7 @@ function handleSubmission_(user, form) {
   }
 }
 
-const VERSION = '2026-10-22.3';
+const VERSION = '2026-10-20.6';
 
 // Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
@@ -390,10 +393,8 @@ function handleBotUpdate_(e) {
   try {
     if (e.parameter.tg !== prop_('TG_WEBHOOK_SECRET')) return ok;
     const update = JSON.parse(e.postData.contents);
+    if (alreadyHandled_(update.update_id)) return ok;
     const cache = CacheService.getScriptCache();
-    const seenKey = 'upd_' + update.update_id;
-    if (cache.get(seenKey)) return ok;
-    cache.put(seenKey, '1', 21600);
 
     const msg = update.message;
     if (!msg || !msg.chat || msg.chat.type !== 'private') return ok;
@@ -406,6 +407,10 @@ function handleBotUpdate_(e) {
         form = JSON.parse(msg.web_app_data.data);
       } catch (err) {
         form = {};
+      }
+      if (isDoubleTap_(msg.from.id, msg.web_app_data.data)) {
+        log_(String(msg.from.id), 'відхилено', 'повтор тієї самої анкети');
+        return ok;
       }
       const res = handleSubmission_(msg.from, form);
       if (!res.ok) sendWithKeyboard_(chatId, '❌ ' + res.error + '\nСпробуйте ще раз — кнопка «' + KEYBOARD_BUTTON_TEXT + '» внизу.');
@@ -432,6 +437,54 @@ function handleBotUpdate_(e) {
     log_(SYSTEM_LOG_ID, 'помилка', 'бот: ' + (err && err.message || err));
   }
   return ok;
+}
+
+/**
+ * Чи це оновлення вже оброблено. Телеграм повторює доставку годинами, тому позначки живуть
+ * у властивостях скрипта (кеш Apps Script гарантовано тримає лише кілька годин).
+ */
+function alreadyHandled_(updateId) {
+  if (!updateId && updateId !== 0) return false;
+  const key = SEEN_PREFIX + updateId;
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(20000);
+  } catch (e) {
+    return true; // інша копія вже обробляє це саме оновлення
+  }
+  try {
+    const props = PropertiesService.getScriptProperties();
+    if (props.getProperty(key)) return true;
+    props.setProperty(key, String(Date.now()));
+    return false;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Та сама анкета двічі поспіль (подвійний дотик, повтор із кнопки) — пропускаємо другу. */
+function isDoubleTap_(userId, payload) {
+  const cache = CacheService.getScriptCache();
+  const key = 'tap_' + userId + '_' + simpleHash_(payload);
+  if (cache.get(key)) return true;
+  cache.put(key, '1', DOUBLE_TAP_SEC);
+  return false;
+}
+
+function simpleHash_(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return String(h);
+}
+
+/** Прибирає старі позначки оброблених оновлень, щоб властивості скрипта не розросталися. */
+function pruneSeenUpdates_() {
+  const props = PropertiesService.getScriptProperties();
+  const all = props.getProperties();
+  const cutoff = Date.now() - SEEN_KEEP_DAYS * 86400000;
+  Object.keys(all).forEach((k) => {
+    if (k.indexOf(SEEN_PREFIX) === 0 && Number(all[k]) < cutoff) props.deleteProperty(k);
+  });
 }
 
 /** Повідомлення з великою кнопкою анкети на всю ширину внизу чату (лишається постійно). */
@@ -593,6 +646,7 @@ function setup() {
 
 /** Щодня: якщо за добу були спроби, але жодна не пройшла, — сповіщення адміну. */
 function dailyMonitor() {
+  pruneSeenUpdates_();
   const sheet = getLogSheet_();
   const last = sheet.getLastRow();
   if (last < 2) return;
