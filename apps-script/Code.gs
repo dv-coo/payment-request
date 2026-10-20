@@ -148,7 +148,7 @@ function handleSubmission_(user, form) {
   }
 }
 
-const VERSION = '2026-10-20.7';
+const VERSION = '14'; // номер складання: зростає з кожною зміною коду
 
 // Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
@@ -933,10 +933,11 @@ function checkDeployedVersion_() {
   const got = UrlFetchApp.fetch(execUrl_(), { muteHttpExceptions: true, followRedirects: true })
     .getContentText().trim();
   if (got !== 'ok ' + VERSION) {
-    throw new Error('За адресою WEBAPP_URL працює інша версія коду («' + got.slice(0, 30) + '»), ' +
-      'а в редакторі — ' + VERSION + '. Запити з анкети обробляє стара версія. ' +
-      '«Розгорнути» → «Керування розгортаннями» → розгортання з адресою з WEBAPP_URL → ✏️ → ' +
-      '«Версія: Нова версія» → «Розгорнути». Потім запустіть setup ще раз.');
+    throw new Error('Запити з анкети обробляє стара версія коду: за адресою WEBAPP_URL — «' +
+      got.slice(0, 30) + '», а в редакторі — складання ' + VERSION + '. Відкрийте ' +
+      'https://script.google.com/home/projects/' + ScriptApp.getScriptId() + '/deployments, ' +
+      'натисніть ✏️ біля введення в дію, у полі «Версія» виберіть «Нова версія» і натисніть ' +
+      '«Ввести в дію». Потім запустіть setup ще раз.');
   }
 }
 
