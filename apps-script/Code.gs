@@ -148,7 +148,7 @@ function handleSubmission_(user, form) {
   }
 }
 
-const VERSION = '2026-10-20.6';
+const VERSION = '2026-10-20.7';
 
 // Відкрити адресу …/exec у браузері — покаже, яка версія коду зараз опублікована.
 function doGet() {
@@ -642,6 +642,9 @@ function setup() {
   }
   Logger.log('Готово. Довідники з FinMap: %s', JSON.stringify(sync.counts));
   Logger.log('Адреса анкети для BotFather → Configure Mini App: %s', form);
+  const id = ScriptApp.getScriptId();
+  Logger.log('Прямі посилання:\n  редактор коду: https://script.google.com/home/projects/%s/edit' +
+    '\n  введення в дію: https://script.google.com/home/projects/%s/deployments', id, id);
 }
 
 /** Щодня: якщо за добу були спроби, але жодна не пройшла, — сповіщення адміну. */
